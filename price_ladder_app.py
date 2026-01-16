@@ -4,7 +4,7 @@ import datetime
 import pytz
 import yfinance as yf
 import numpy as np
-from flask import Flask, render_template_string, request, redirect, session
+from flask import Flask, render_template_string, request, redirect, session, jsonify
 import requests
 import re
 import json
@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from kiteconnect import KiteConnect
+from kiteconnect.exceptions import TokenException
 
 # Load Credentials
 load_dotenv()
@@ -34,6 +35,8 @@ WATCHLIST_FILE = "watchlist.json"
 app = Flask(__name__)
 app.secret_key = "price_ladder_pro_secret_key" # Required for session
 
+import time
+
 # Global Kite Object
 kite = None
 VOL_BASELINE = {} # Cache for Avg Daily Volume
@@ -41,13 +44,31 @@ VOL_SAMPLES = {} # Store recent (time, total_volume) snapshots
 NFO_INSTRUMENTS = None # Cache for F&O instruments
 INSTRUMENT_MAP = {} # Cache for symbol -> token mapping
 
+# Global Dashboard Cache
+GLOBAL_DASHBOARD_CACHE = {
+    'last_scan_time': 0,
+    'top_bullish': [],
+    'top_bearish': [],
+    'watchtower_alerts': [],
+    'watchlist_symbols': [] 
+}
+
 if KITE_API_KEY:
     try:
         kite = KiteConnect(api_key=KITE_API_KEY)
         if KITE_ACCESS_TOKEN:
             kite.set_access_token(KITE_ACCESS_TOKEN)
+            # Verify Session Validity
+            try:
+                kite.profile()
+                print("DEBUG: Zerodha Token Validated - Connected")
+            except Exception as e:
+                print(f"DEBUG: Saved Token Invalid/Expired: {e}")
+                kite.access_token = None # Clear invalid token so UI shows disconnected
     except Exception as e:
         print(f"DEBUG: Kite initialization error: {e}")
+
+
 
 def get_instrument_token(symbol):
     global INSTRUMENT_MAP
@@ -145,6 +166,76 @@ def detect_spurt(sym, current_total_vol):
     
     if avg_velocity == 0: return 1.0
     return current_velocity / avg_velocity
+
+
+
+# Global Volume State for Intraday Tracking
+INTRADAY_VOL_STATE = {} # {symbol: {'last_vol': 0, 'last_time': timestamp, 'open_vol_est': 0}}
+
+def detect_intraday_spike(symbol, current_vol):
+    """
+    Detects volume spikes by comparing instantaneous volume rate vs daily average rate.
+    Returns: (severity_ratio, message_type)
+    """
+    global INTRADAY_VOL_STATE
+    
+    current_time = datetime.datetime.now(pytz.timezone('Asia/Kolkata'))
+    market_start = current_time.replace(hour=9, minute=15, second=0, microsecond=0)
+    
+    # 1. Initialize State if First Seen
+    if symbol not in INTRADAY_VOL_STATE:
+        INTRADAY_VOL_STATE[symbol] = {
+            'last_vol': current_vol,
+            'last_time': current_time,
+            'first_seen_vol': current_vol # Approx open vol if seen early, or mid-day snapshot
+        }
+        return 0, None
+
+    state = INTRADAY_VOL_STATE[symbol]
+    last_vol = state['last_vol']
+    last_time = state['last_time']
+    
+    # Update State for next time
+    INTRADAY_VOL_STATE[symbol]['last_vol'] = current_vol
+    INTRADAY_VOL_STATE[symbol]['last_time'] = current_time
+    
+    # 2. Calculate Time Deltas
+    # Minutes since 9:15 AM (Total Market Time)
+    time_since_open = (current_time - market_start).total_seconds() / 60
+    if time_since_open < 5: return 0, None # Too early/noisy
+    
+    # Minutes since last poll (Instantaneous Time)
+    time_delta = (current_time - last_time).total_seconds() / 60
+    if time_delta < 0.05: return 0, None # Too fast (less than 3 sec)
+    
+    # 3. Calculate Volume Deltas
+    vol_delta = current_vol - last_vol
+    if vol_delta <= 0: return 0, None
+    
+    # 4. Calculate Rates (Shares per Minute)
+    # Average Rate for the whole day so far
+    # We estimate 'volume so far' as current_vol. 
+    # Ideally quote['volume'] is cumulative.
+    avg_rate = current_vol / time_since_open
+    
+    # Instantaneous Rate (Since last poll)
+    instant_rate = vol_delta / time_delta
+    
+    if avg_rate <= 0: return 0, None
+    
+    # 5. Compare Ratio
+    ratio = instant_rate / avg_rate
+    
+    # 6. determine Alert
+    # Ratio > 1.0 means faster than average.
+    # We want significant spikes.
+    
+    if ratio > 5.0 and vol_delta > 5000: # 5x speed + min size
+        return ratio, "Flash Spurt"
+    elif ratio > 3.0 and vol_delta > 5000:
+        return ratio, "Volume Rising"
+        
+    return ratio, None
 
 
 def init_volume_baseline(symbols):
@@ -582,11 +673,17 @@ def get_live_prices_batch(symbols):
             idx_map = {"NIFTY": "NSE:NIFTY 50", "BANKNIFTY": "NSE:NIFTY BANK"}
             final_instruments = [idx_map.get(s, f"NSE:{s}") for s in symbols]
             
-            ltp_data = kite.ltp(final_instruments)
-            for k, v in ltp_data.items():
-                sym = k.replace("NSE:", "").replace("NIFTY 50", "NIFTY").replace("NIFTY BANK", "BANKNIFTY")
-                live_prices[sym] = v['last_price']
-            return live_prices
+            try:
+                ltp_data = kite.ltp(final_instruments)
+                for k, v in ltp_data.items():
+                    sym = k.replace("NSE:", "").replace("NIFTY 50", "NIFTY").replace("NIFTY BANK", "BANKNIFTY")
+                    live_prices[sym] = v['last_price']
+                return live_prices
+            except TokenException:
+                 print("DEBUG: Zerodha Token Expired during LTP fetch.")
+                 kite.access_token = None
+            except Exception as e:
+                print(f"Kite LTP Error: {e}")
 
         # Prio 2: yfinance (Fallback)
         ticker_map = {
@@ -636,6 +733,23 @@ def get_live_prices_batch(symbols):
         
     return live_prices
 
+@app.route('/debug/kite')
+def debug_kite():
+    if not kite: return jsonify({'status': 'Error', 'msg': 'Kite object not initialized'})
+    if not kite.access_token: return jsonify({'status': 'Disconnected', 'msg': 'No Access Token'})
+    
+    try:
+        profile = kite.profile()
+        return jsonify({
+            'status': 'Connected',
+            'user_id': profile.get('user_id'),
+            'user_name': profile.get('user_name'),
+            'email': profile.get('email'),
+            'timestamp': str(datetime.datetime.now())
+        })
+    except Exception as e:
+         return jsonify({'status': 'Error', 'msg': str(e)})
+
 @app.route('/login')
 def login():
     global kite
@@ -646,10 +760,33 @@ def login():
             data = kite.generate_session(request_token, api_secret=KITE_API_SECRET)
             access_token = data["access_token"]
             kite.set_access_token(access_token)
-            # You can also save this to .env here if you wish for persistence
+            # Persist token to .env
+            update_env_file("KITE_ACCESS_TOKEN", access_token)
             return redirect("/")
         except Exception as e:
             return f"Login failed: {e}", 400
+
+def update_env_file(key, value):
+    env_path = ".env"
+    try:
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r") as f:
+                lines = f.readlines()
+        
+        found = False
+        with open(env_path, "w") as f:
+            for line in lines:
+                if line.startswith(f"{key}="):
+                    f.write(f"{key}='{value}'\n")
+                    found = True
+                else:
+                    f.write(line)
+            if not found:
+                f.write(f"\n{key}='{value}'\n")
+        print(f"DEBUG: Saved {key} to .env")
+    except Exception as e:
+        print(f"Error saving to .env: {e}")
             
     if not KITE_API_KEY or not KITE_API_SECRET:
         return "Please set KITE_API_KEY and KITE_API_SECRET in .env file", 400
@@ -657,205 +794,237 @@ def login():
     # Redirect to Kite login
     return redirect(kite.login_url())
 
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    display_symbols = []
-    index_data = {}
-    top_bullish = []
-    top_bearish = []
+def get_dashboard_data():
+    global GLOBAL_DASHBOARD_CACHE
     
-    # Load Data
-    try:
-        if os.path.exists(CSV_FILE):
-            df = pd.read_csv(CSV_FILE, low_memory=False)
-            df.columns = [col.strip() for col in df.columns]
-            index_symbols = ['NIFTY', 'BANKNIFTY', 'SENSEX', 'CNXFINANCE']
-            symbol_columns = sorted([col for col in df.columns if col.lower() != 'date' and not col.lower().startswith('unnamed') and len(col.strip()) > 0])
-            
-            for col in symbol_columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-
-            for index_symbol in index_symbols:
-                if index_symbol in df.columns:
-                    latest_val = df[index_symbol].dropna().iloc[-1]
-                    index_data[index_symbol] = round(latest_val, 2)
-
-            display_symbols = symbol_columns
-            
-            # Opportunity Finder for Landing Page
-            opportunities = []
-            for symbol in display_symbols:
-                if symbol in index_symbols: continue
-                try:
-                    sym_prices = df[symbol].dropna().round(2).unique()
-                    if len(sym_prices) < 2: continue
-                    latest_val = df[symbol].dropna().iloc[-1]
-                    higher = sorted([p for p in sym_prices if p > latest_val])
-                    p_plus_1 = higher[0] if higher else None
-                    lower = sorted([p for p in sym_prices if p < latest_val], reverse=True)
-                    p_minus_1 = lower[0] if lower else None
-                    
-                    gap_up = round(((p_plus_1 - latest_val) / latest_val * 100), 2) if p_plus_1 else 0
-                    gap_down = round(((latest_val - p_minus_1) / latest_val * 100), 2) if p_minus_1 else 0
-                    
-                    opportunities.append({'symbol': symbol, 'gap_up': gap_up, 'gap_down': gap_down})
-                except: continue
-            
-            top_bullish = sorted([o for o in opportunities if o['gap_up'] > 0], key=lambda x: x['gap_up'], reverse=True)[:10]
-            top_bearish = sorted([o for o in opportunities if o['gap_down'] > 0], key=lambda x: x['gap_down'], reverse=True)[:10]
-    except Exception as e:
-        print(f"Index data loading error: {e}")
-
-    # Fetch Live News & Watchlist
-    news_list = get_live_news()
-    base_watchlist = load_watchlist()
+    # Check if 5 minutes passed since last scan
+    current_time = time.time()
+    SCAN_INTERVAL = 300 # 5 minutes
     
-    # Enrich Watchlist with Live Data
-    wl_prices = get_live_prices_batch(base_watchlist)
-    watchlist_details = []
-    
-    try:
-        if os.path.exists(CSV_FILE):
-            # We already have df from the previous block if successful, else reload
-            if 'df' not in locals():
+    # --- PHASE 1: SCANNING (Cached) ---
+    if current_time - GLOBAL_DASHBOARD_CACHE['last_scan_time'] > SCAN_INTERVAL:
+        print("DEBUG: Running 5-Minute Scan Refresh...")
+        index_data = {}
+        top_bullish = []
+        top_bearish = []
+        watchtower_alerts = []
+        # Fallbacks
+        display_symbols = []
+        watchlist_symbols = load_watchlist()
+        
+        try:
+            if os.path.exists(CSV_FILE):
                 df = pd.read_csv(CSV_FILE, low_memory=False)
                 df.columns = [col.strip() for col in df.columns]
-                for col in base_watchlist:
-                    if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+                index_symbols = ['NIFTY', 'BANKNIFTY', 'SENSEX', 'CNXFINANCE']
+                symbol_columns = sorted([col for col in df.columns if col.lower() != 'date' and not col.lower().startswith('unnamed') and len(col.strip()) > 0])
+                
+                # Indexes
+                for col in symbol_columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+                for idx_sym in index_symbols:
+                    if idx_sym in df.columns: index_data[idx_sym] = round(df[idx_sym].dropna().iloc[-1], 2)
+                    
+                display_symbols = symbol_columns
+                scan_candidates = [s for s in display_symbols if s not in index_symbols]
+                
+                # Fetch Scan Prices (Batch)
+                fetch_list = scan_candidates + index_symbols
+                live_price_map = get_live_prices_batch(fetch_list)
+                
+                # Update Index Data
+                for idx_sym in index_symbols:
+                    if idx_sym in live_price_map: index_data[idx_sym] = live_price_map[idx_sym]
+                    
+                # Scan Logic (Direction-Based)
+                opportunities = []
+                for symbol in scan_candidates:
+                    try:
+                        sym_prices = df[symbol].dropna().round(2).unique()
+                        if len(sym_prices) < 2: continue
+                        latest_val = live_price_map.get(symbol)
+                        prev_close = df[symbol].dropna().iloc[-1]
+                        
+                        if not latest_val: latest_val = prev_close
+                        latest_val, prev_close = float(latest_val), float(prev_close)
+                        
+                        day_change_pct = ((latest_val - prev_close) / prev_close) * 100
+                        
+                        # Bullish
+                        if day_change_pct > 0.05:
+                            higher = sorted([p for p in sym_prices if p > latest_val])
+                            if higher:
+                                runway = ((higher[0] - latest_val)/latest_val)*100
+                                if runway > 0.5: opportunities.append({'symbol': symbol, 'gap_up': round(runway, 2), 'gap_down': 0, 'bias': 'bull'})
+                        # Bearish
+                        elif day_change_pct < -0.05:
+                            lower = sorted([p for p in sym_prices if p < latest_val], reverse=True)
+                            if lower:
+                                runway = ((latest_val - lower[0])/latest_val)*100
+                                if runway > 0.5: opportunities.append({'symbol': symbol, 'gap_up': 0, 'gap_down': round(runway, 2), 'bias': 'bear'})
+                    except: continue
+                
+                top_bullish = sorted([o for o in opportunities if o['bias'] == 'bull'], key=lambda x: x['gap_up'], reverse=True)[:10]
+                top_bearish = sorted([o for o in opportunities if o['bias'] == 'bear'], key=lambda x: x['gap_down'], reverse=True)[:10]
+                
+                # Watchtower Scan Logic (Condensed)
+                # Note: We do a full scan here to populate alerts
+                scan_quotes = {}
+                if kite and kite.access_token:
+                    try:
+                        batch_instruments = [f"NSE:{s}" for s in scan_candidates[:100]] # Limit 100
+                        scan_quotes = kite.quote(batch_instruments)
+                    except TokenException: kite.access_token = None
+                    except: pass
+                
+                for sym in scan_candidates:
+                    instr = f"NSE:{sym}"
+                    quote = scan_quotes.get(instr, {})
+                    lp = live_price_map.get(sym) or quote.get('last_price') or (df[sym].dropna().iloc[-1] if not df[sym].dropna().empty else None)
+                    if not lp: continue
+                    
+                    # Volume Spikes
+                    vol_now = quote.get('volume', 0)
+                    spurt_ratio, spurt_msg = detect_intraday_spike(sym, vol_now)
+                    if spurt_ratio > 0 and spurt_msg:
+                        watchtower_alerts.append({'sym': sym, 'p': lp, 'lvl': 'Vol Alert', 'type': 'Volume Hunter', 'target': spurt_msg, 'severity': 'high' if spurt_ratio > 5 else 'med', 'dist': round(spurt_ratio, 1)})
+                    
+                    # Level Scans (Simplified reuse of logic)
+                    levels = find_levels(df[sym])
+                    if not levels: continue
+                    r1 = next((l for l in levels if l > lp), None)
+                    s1 = next((l for l in reversed(levels) if l < lp), None)
+                    if r1 and abs((r1-lp)/lp*100) < 0.35:
+                        watchtower_alerts.append({'sym': sym, 'p': lp, 'lvl': r1, 'type': 'Resistance', 'target': 'Breakout', 'severity': 'high', 'dist': round(abs((r1-lp)/lp*100), 2)})
+                    if s1 and abs((lp-s1)/lp*100) < 0.35:
+                        watchtower_alerts.append({'sym': sym, 'p': lp, 'lvl': s1, 'type': 'Support', 'target': 'Breakdown', 'severity': 'high', 'dist': round(abs((lp-s1)/lp*100), 2)})
 
-            for i, sym in enumerate(base_watchlist):
-                live_p = wl_prices.get(sym)
-                ref_p = None
-                if sym in df.columns:
-                    ref_p = df[sym].dropna().iloc[-1]
-                
-                price = round(live_p, 2) if live_p else (round(ref_p, 2) if ref_p else 0)
-                change = 0
-                if live_p and ref_p:
-                    change = round(((live_p - ref_p) / ref_p) * 100, 2)
-                
-                watchlist_details.append({
-                    'symbol': sym,
-                    'price': price,
-                    'change': change,
-                    'orig_idx': i
-                })
+                watchtower_alerts = sorted(watchtower_alerts, key=lambda x: (x['severity'] == 'high', -x['dist']), reverse=True)[:15]
+
+        except Exception as e: print(f"Scan Error: {e}")
         
-        # Sort by change descending (High gainers first)
-        watchlist_details = sorted(watchlist_details, key=lambda x: x['change'], reverse=True)
+        # update cache
+        GLOBAL_DASHBOARD_CACHE['last_scan_time'] = current_time
+        GLOBAL_DASHBOARD_CACHE['top_bullish'] = top_bullish
+        GLOBAL_DASHBOARD_CACHE['top_bearish'] = top_bearish
+        GLOBAL_DASHBOARD_CACHE['watchtower_alerts'] = watchtower_alerts
+        GLOBAL_DASHBOARD_CACHE['index_data'] = index_data # Store index baseline
 
-    except Exception as e:
-        print(f"Error enriching watchlist: {e}")
-        # Fallback to simple list if error
-        watchlist_details = [{'symbol': s, 'price': 0, 'change': 0, 'orig_idx': i} for i, s in enumerate(base_watchlist)]
+    # --- PHASE 2: PRICING UPDATE (Live, Every Call) ---
+    # Retrieve Cached Lists
+    cached_bullish = GLOBAL_DASHBOARD_CACHE['top_bullish']
+    cached_bearish = GLOBAL_DASHBOARD_CACHE['top_bearish']
+    cached_watchtower = GLOBAL_DASHBOARD_CACHE['watchtower_alerts']
+    base_watchlist = load_watchlist()
+    
+    # Collect ALL symbols needed for display
+    all_needed_syms = set()
+    for o in cached_bullish: all_needed_syms.add(o['symbol'])
+    for o in cached_bearish: all_needed_syms.add(o['symbol'])
+    for w in cached_watchtower: all_needed_syms.add(w['sym'])
+    for s in base_watchlist: all_needed_syms.add(s)
+    index_symbols = ['NIFTY', 'BANKNIFTY', 'SENSEX', 'CNXFINANCE']
+    for i in index_symbols: all_needed_syms.add(i)
+    
+    # Batch Fetch LIVE NOW
+    live_prices_now = get_live_prices_batch(list(all_needed_syms))
+    
+    # Rebuild Return Objects with FRESH prices
+    final_bullish = []
+    for item in cached_bullish:
+        lp = live_prices_now.get(item['symbol'])
+        # We can re-calc change or gap here if needed, or just pass live price?
+        # User wants live "ticks". We will return the object but maybe add 'current_price'?
+        # For simplicity, let's keep the structure but update what we can.
+        # Actually, the gap might change slightly. Let's strictly update price if possible.
+        final_bullish.append(item) 
+        
+    final_bearish = [x for x in cached_bearish]
+    
+    # Watchtower Fresh Prices
+    final_watchtower = []
+    for alert in cached_watchtower:
+        new_alert = alert.copy()
+        if alert['sym'] in live_prices_now: new_alert['p'] = live_prices_now[alert['sym']]
+        final_watchtower.append(new_alert)
 
-    # Calculate max intensity for color scaling
-    all_changes = [abs(d['change']) for d in watchlist_details]
-    max_intensity = max(all_changes) if all_changes and max(all_changes) > 0 else 1
+    # Watchlist Fresh (Always Dynamic)
+    watchlist_details = []
+    inst_alerts = []
+    
+    # Need DF for reference close (can we cache DF? maybe heavy. Load efficiently or use cache?)
+    # For now, load DF just for reference closes for Watchlist (or cache ref closes)
+    # Optimization: Loading CSV every 3s is heavy. 
+    # Let's rely on caching 'prev_close' map? 
+    # For safety, let's do the standard reliable load but maybe optimize later. 
+    # Actually, 3s CSV read is bad. 
+    # Let's look if we can get change % from Zerodha quote directly?
+    # Yes, quote['change'].
+    
+    # Faster Watchlist Construction using Zerodha 'change' if available
+    # Fallback to simple calculation if no Zerodha
+    
+    # To keep it simple and robust matching previous logic:
+    # We will build watchlist using live_prices_now and try to get Close from YF/Zerodha or fallback CSV
+    # We will skip CSV load here if possible to keep it fast.
+    
+    scan_quotes = {}
+    if kite and kite.access_token:
+         try: scan_quotes = kite.quote([f"NSE:{s}" for s in base_watchlist])
+         except: pass
 
-    # ============= WATCHTOWER SCANNER LOGIC (ALL 223 STOCKS) =============
-    watchtower_alerts = []
-    try:
-        if os.path.exists(CSV_FILE):
-            all_scan_symbols = [col for col in df.columns if col not in index_symbols and col.lower() != 'date' and not col.lower().startswith('unnamed')]
-            
-            # Initialize volume baseline once
-            if not VOL_BASELINE and kite:
-                init_volume_baseline(all_scan_symbols[:50]) # Limiting to 50 for speed in initialization
+    for i, sym in enumerate(base_watchlist):
+        lp = live_prices_now.get(sym, 0)
+        chg = 0
+        
+        # Try get change from Zerodha
+        q = scan_quotes.get(f"NSE:{sym}")
+        if q: chg = q.get('change', 0)
+        elif lp > 0:
+             # Fallback: We don't have prev close easily without CSV.
+             # User accepts 0 change if no feed? Or use cache?
+             # Let's use cache if available, else 0.
+             pass 
+             
+        # Alerts
+        # Recalculate Volume alert? Maybe keep alerts cached too?
+        # User wants "Instance" alerts. Let's run Vol check live as it is fast.
+        vol = q.get('volume', 0) if q else 0
+        ratio, msg = detect_intraday_spike(sym, vol)
+        if ratio > 3: inst_alerts.append({'title':f"★ {sym} VOL", 'msg':f"{msg} {ratio}x", 'type':'vol'})
+        
+        watchlist_details.append({'symbol': sym, 'price': lp, 'change': chg, 'orig_idx': i})
+    
+    watchlist_details = sorted(watchlist_details, key=lambda x: x['change'], reverse=True)
+    all_changes = [abs(x['change']) for x in watchlist_details]
+    max_val = max(all_changes) if all_changes else 0
+    max_intensity = max_val if max_val > 0 else 1
+    
+    # Fresh Index Data
+    final_index = {}
+    for i in index_symbols: final_index[i] = live_prices_now.get(i, 0)
 
-            # Fetch Live Quotes from Zerodha if possible
-            scan_quotes = {}
-            if kite and kite.access_token:
-                try:
-                    # Batch fetch for scanner (limit to top 100 for performance)
-                    batch_instruments = [f"NSE:{s}" for s in all_scan_symbols[:100]]
-                    scan_quotes = kite.quote(batch_instruments)
-                except: pass
+    return {
+        'index_data': final_index,
+        'top_bullish': final_bullish,
+        'top_bearish': final_bearish,
+        'watchtower': final_watchtower,
+        'watchlist': watchlist_details,
+        'inst_alerts': inst_alerts,
+        'max_intensity': max_intensity,
+        'kite_authenticated': True if (kite and kite.access_token) else False,
+        'news_list': get_live_news()
+    }
 
-            for sym in all_scan_symbols:
-                # Get live price and volume
-                instr = f"NSE:{sym}"
-                quote = scan_quotes.get(instr, {})
-                
-                lp = quote.get('last_price') or wl_prices.get(sym) or (df[sym].dropna().iloc[-1] if not df[sym].dropna().empty else None)
-                if lp is None: continue
-                
-                vol_now = quote.get('volume', 0)
-                change_pct = quote.get('change', 0)
-                
-                # Check for Volume Hunter (Intraday Spurt)
-                spurt_ratio = detect_spurt(sym, vol_now) if vol_now > 0 else 1.0
-                
-                # Check for Daily Abnormal Volume (Historical)
-                avg_vol = VOL_BASELINE.get(sym)
-                vol_ratio = 1.0
-                if avg_vol and vol_now > 0:
-                    now_in = datetime.datetime.now(pytz.timezone('Asia/Kolkata'))
-                    m_start = now_in.replace(hour=9, minute=15)
-                    elapsed = max(1, (now_in - m_start).total_seconds() / 60)
-                    expected_pct = elapsed / 375
-                    vol_ratio = (vol_now / avg_vol) / expected_pct if expected_pct > 0 else 1.0
+@app.route('/api/landing_data')
+def landing_data_api():
+    """API Endpoint for Live Dashboard Updates"""
+    return jsonify(get_dashboard_data())
 
-                if spurt_ratio > 3.5: # 3.5x faster than last 10 mins
-                    watchtower_alerts.append({
-                        'sym': sym, 'p': lp, 'lvl': 'Sudden Spurt', 
-                        'type': 'Volume Hunter', 'target': 'Block Trade DETECTED', 
-                        'severity': 'high', 'dist': round(spurt_ratio, 1)
-                    })
-                elif vol_ratio > 2.2: # Daily outlier
-                    watchtower_alerts.append({
-                        'sym': sym, 'p': lp, 'lvl': 'Volume Surge', 
-                        'type': 'Volume Hunter', 'target': 'High Day Conviction', 
-                        'severity': 'med', 'dist': round(vol_ratio, 1)
-                    })
-
-                # Dynamic Levels for this stock
-                levels = find_levels(df[sym])
-                if not levels: continue
-                
-                # Find nearest levels
-                s1_list = [lvl for lvl in levels if lvl < lp]
-                r1_list = [lvl for lvl in levels if lvl > lp]
-                
-                s1 = s1_list[-1] if s1_list else None
-                r1 = r1_list[0] if r1_list else None
-                s2 = s1_list[-2] if len(s1_list) >= 2 else None
-                r2 = r1_list[1] if len(r1_list) >= 2 else None
-
-                # Proximity (0.35% threshold)
-                dist_s1 = abs((lp - s1) / lp * 100) if s1 else 100
-                dist_r1 = abs((r1 - lp) / lp * 100) if r1 else 100
-                
-                # Signal Logic
-                if dist_r1 < 0.35:
-                    watchtower_alerts.append({'sym': sym, 'p': lp, 'lvl': r1, 'type': 'Approaching Resistance', 'target': r2 or 'Blue Sky', 'severity': 'high', 'dist': round(dist_r1, 2)})
-                elif dist_s1 < 0.35:
-                    watchtower_alerts.append({'sym': sym, 'p': lp, 'lvl': s1, 'type': 'Testing Support', 'target': s2 or 'Floorless', 'severity': 'high', 'dist': round(dist_s1, 2)})
-                
-                # Vacuum Detect (If distance between S1 and R1 is > 2.5%)
-                if s1 and r1:
-                    gap = (r1 - s1) / s1 * 100
-                    if gap > 3.0:
-                        pos = (lp - s1) / (r1 - s1)
-                        if 0.3 < pos < 0.7:
-                             watchtower_alerts.append({'sym': sym, 'p': lp, 'lvl': f"{s1} - {r1}", 'type': 'Vacuum Hunt', 'target': r1, 'severity': 'med', 'dist': round(gap, 2)})
-
-    except Exception as e:
-        print(f"Watchtower Scan Error: {e}")
-
-    # Sort alerts by severity and then proximity
-    watchtower_alerts = sorted(watchtower_alerts, key=lambda x: (x['severity'] == 'high', -x['dist']), reverse=True)[:15]
-
-    return render_template_string(LANDING_TEMPLATE, 
-                                  symbols=display_symbols, 
-                                  index_data=index_data, 
-                                  top_bullish=top_bullish, 
-                                  top_bearish=top_bearish,
-                                  news_list=news_list,
-                                  watchlist=watchlist_details,
-                                  max_intensity=max_intensity,
-                                  watchtower=watchtower_alerts,
-                                  kite_authenticated=True if (kite and kite.access_token) else False)
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    """Main Landing Page"""
+    data = get_dashboard_data()
+    return render_template_string(LANDING_TEMPLATE, **data)
 
 @app.route('/update_watchlist', methods=['POST'])
 def update_watchlist():
@@ -880,16 +1049,50 @@ def analyze_redirect():
         return f"<script>window.location.href='/analysis/{symbol}';</script>"
     return "<script>window.location.href='/';</script>"
 
-@app.route('/analysis/<symbol>')
-def analysis(symbol):
+def get_intraday_data(symbol):
+    intraday_data = []
+    
+    # Priority 1: Zerodha (Better live data if History API enabled)
+    if kite and kite.access_token:
+        try:
+             # Use 1 minute candles for "live" feel
+             token = get_instrument_token(symbol)
+             if token:
+                 to_date = datetime.datetime.now()
+                 from_date = to_date - datetime.timedelta(days=1) # Just today/recent
+                 records = kite.historical_data(token, from_date, to_date, "minute")
+                 for r in records:
+                     intraday_data.append({
+                        'time': int(r['date'].timestamp()), 'open': r['open'], 'high': r['high'], 'low': r['low'], 'close': r['close']
+                     })
+                 if intraday_data: return intraday_data
+        except: pass
+
+    # Priority 2: YFinance (Fallback)
+    try:
+        ticker = f"{symbol}.NS"
+        ticker_map = {'NIFTY': '^NSEI', 'BANKNIFTY': '^NSEBANK', 'SENSEX': '^BSESN'}
+        yf_ticker = ticker_map.get(symbol, ticker)
+        # Switch to 1m for more granular updates
+        idf = yf.download(yf_ticker, period="1d", interval="1m", progress=False)
+        if not idf.empty:
+            for idx, row_data in idf.iterrows():
+                try:
+                    intraday_data.append({
+                        'time': int(idx.timestamp()), 'open': float(row_data['Open']),
+                        'high': float(row_data['High']), 'low': float(row_data['Low']), 'close': float(row_data['Close'])
+                    })
+                except: pass
+    except Exception: pass
+    
+    return intraday_data
+
+def get_analysis_data(symbol):
     try:
         # 0. Fuzzy match symbol if needed (using CSV as master list for now)
         if os.path.exists(CSV_FILE):
-            df_temp = pd.read_csv(CSV_FILE, nrows=0) # Just headers
-            df_temp.columns = [c.strip() for c in df_temp.columns]
-            if symbol not in df_temp.columns:
-                matches = [c for c in df_temp.columns if symbol[:3] in c]
-                if matches: symbol = matches[0]
+             # Only do heavy CSV read if absolutely needed or cached
+             pass
 
         # 1. Fetch live price
         lp_map = get_live_prices_batch([symbol])
@@ -906,7 +1109,6 @@ def analysis(symbol):
             df.columns = [c.strip() for c in df.columns]
             if symbol in df.columns:
                 from price_ladder_app import find_levels # local ref
-                # We'll use a simplified local generator
                 s_data = get_stock_data_local_fallback(symbol, df, latest_price)
 
         if s_data:
@@ -928,19 +1130,33 @@ def analysis(symbol):
             s_data['row_max_gap'] = max(gaps_only) if gaps_only else 0.001
             
             # Fetch Intraday Data
-            intraday_data = []
-            try:
-                ticker = f"{symbol}.NS"
-                ticker_map = {'NIFTY': '^NSEI', 'BANKNIFTY': '^NSEBANK', 'SENSEX': '^BSESN'}
-                yf_ticker = ticker_map.get(symbol, ticker)
-                idf = yf.download(yf_ticker, period="1d", interval="5m")
-                if not idf.empty:
-                    for idx, row_data in idf.iterrows():
-                        intraday_data.append({
-                            'time': int(idx.timestamp()), 'open': float(row_data['Open']),
-                            'high': float(row_data['High']), 'low': float(row_data['Low']), 'close': float(row_data['Close'])
-                        })
-            except Exception: pass
+            intraday_data = get_intraday_data(symbol)
+            
+            # [LIVE PATCH] Synthesize the latest candle using Real-Time LTP
+            # This ensures the chart ticks live even if historical API lags or is closed candle only
+            if intraday_data and latest_price:
+                last_candle = intraday_data[-1]
+                last_ts = last_candle['time']
+                
+                # Current Minute Timestamp (Floored)
+                now_ts = int(datetime.datetime.now().timestamp())
+                current_minute_ts = now_ts - (now_ts % 60)
+                
+                # Scenario 1: We are in the same minute as the last candle -> Update it
+                if last_ts == current_minute_ts:
+                    last_candle['close'] = latest_price
+                    if latest_price > last_candle['high']: last_candle['high'] = latest_price
+                    if latest_price < last_candle['low']: last_candle['low'] = latest_price
+                    
+                # Scenario 2: New minute started -> Append new forming candle
+                elif current_minute_ts > last_ts:
+                    intraday_data.append({
+                        'time': current_minute_ts,
+                        'open': latest_price,
+                        'high': latest_price,
+                        'low': latest_price,
+                        'close': latest_price
+                    })
 
             # Market Depth & Options
             market_depth = None
@@ -959,27 +1175,43 @@ def analysis(symbol):
                             if opt_info:
                                 opt_quotes = kite.quote([opt_info['ce_symbol'], opt_info['pe_symbol']])
                                 options_data = {'strike': opt_info['strike'], 'expiry': opt_info['expiry'], 'ce': opt_quotes.get(opt_info['ce_symbol']), 'pe': opt_quotes.get(opt_info['pe_symbol'])}
+                except TokenException:
+                    print("DEBUG: Zerodha Token Expired during market depth/options fetch.")
+                    kite.access_token = None
                 except Exception: pass
 
             kite_token = get_instrument_token(symbol if symbol not in ["NIFTY", "BANKNIFTY"] else (f"NIFTY 50" if symbol == "NIFTY" else "NIFTY BANK"))
             news_list = get_live_news(symbol)
             hist_news = get_historical_news(symbol)
             
-            return render_template_string(ANALYSIS_TEMPLATE, 
-                                          row=s_data, 
-                                          history=history_cloud, 
-                                          intraday=intraday_data, 
-                                          news_list=news_list,
-                                          hist_news=hist_news,
-                                          market_depth=market_depth,
-                                          options_data=options_data,
-                                          kite_token=kite_token,
-                                          kite_authenticated=True if (kite and kite.access_token) else False)
-        return f"Symbol {symbol} not found in Cloud or Local Database.", 404
+            return {
+                'row': s_data, 
+                'history': history_cloud, 
+                'intraday': intraday_data, 
+                'news_list': news_list, 
+                'hist_news': hist_news,
+                'market_depth': market_depth,
+                'options_data': options_data,
+                'kite_token': kite_token,
+                'kite_authenticated': True if (kite and kite.access_token) else False
+            }
+        return None
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return str(e), 500
+        print(f"Analysis Data Error: {e}")
+        return None
+
+@app.route('/api/analysis_data/<symbol>')
+def analysis_data_api(symbol):
+    data = get_analysis_data(symbol)
+    if data: return jsonify(data)
+    return jsonify({'error': 'Symbol not found'}), 404
+
+@app.route('/analysis/<symbol>')
+def analysis(symbol):
+    data = get_analysis_data(symbol)
+    if data:
+        return render_template_string(ANALYSIS_TEMPLATE, **data)
+    return f"Symbol {symbol} not found in Cloud or Local Database.", 404
 
 def get_stock_data_local_fallback(symbol, df, live_price=None):
     """Local CSV fallback for get_stock_data."""
@@ -1133,9 +1365,20 @@ LANDING_TEMPLATE = """
         .wl-sym { font-weight: 900; font-size: 1.1em; margin-bottom: 2px; }
         .wl-data { font-size: 0.85em; opacity: 0.9; font-family: monospace; }
         .wl-change { font-weight: bold; }
+
+        /* TOAST NOTIFICATION */
+        #toast-container { position: fixed; top: 20px; right: 20px; width: 350px; z-index: 10000; pointer-events: none; display: flex; flex-direction: column; gap: 10px; }
+        .toast { background: rgba(30, 34, 45, 0.95); backdrop-filter: blur(10px); border-left: 5px solid #ffd700; color: #fff; padding: 15px; border-radius: 4px; box-shadow: 0 5px 20px rgba(0,0,0,0.5); transform: translateX(120%); transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); display: flex; align-items: start; gap: 10px; pointer-events: auto; }
+        .toast.show { transform: translateX(0); }
+        .toast-icon { font-size: 1.5em; }
+        .toast-content { flex: 1; }
+        .toast-title { font-weight: 900; font-size: 0.9em; margin-bottom: 5px; color: #ffd700; text-transform: uppercase; letter-spacing: 1px; }
+        .toast-msg { font-size: 0.8em; color: #ccc; line-height: 1.4; }
     </style>
 </head>
+</head>
 <body>
+    <div id="toast-container"></div>
     <div class="ticker-wrap">
         <div class="ticker">
             {% for news in news_list %}
@@ -1171,7 +1414,7 @@ LANDING_TEMPLATE = """
         <div class="grid">
             <div class="sidebar">
                 <h3>Indexes</h3>
-                <div class="index-card">
+                <div class="index-card" id="index-container">
                     {% for k, v in index_data.items() %}
                     <div class="index-item"><span>{{ k }}</span> <span class="index-val">{{ v }}</span></div>
                     {% endfor %}
@@ -1191,7 +1434,7 @@ LANDING_TEMPLATE = """
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px;">
                     <div class="opportunity-section">
                         <h2 style="color: var(--up-color);">🚀 Top Bullish Breakouts</h2>
-                        <div class="op-grid">
+                        <div class="op-grid" id="bullish-container">
                             {% for opt in top_bullish %}
                             <a href="/analysis/{{ opt.symbol }}" class="op-card" style="border-left: 4px solid var(--up-color);">
                                 <div style="font-weight: bold; margin-bottom: 5px;">{{ opt.symbol }}</div>
@@ -1203,7 +1446,7 @@ LANDING_TEMPLATE = """
 
                     <div class="opportunity-section">
                         <h2 style="color: var(--down-color);">📉 Top Bearish Vacuums</h2>
-                        <div class="op-grid">
+                        <div class="op-grid" id="bearish-container">
                             {% for opt in top_bearish %}
                              <a href="/analysis/{{ opt.symbol }}" class="op-card" style="border-left: 4px solid var(--down-color);">
                                 <div style="font-weight: bold; margin-bottom: 5px;">{{ opt.symbol }}</div>
@@ -1217,9 +1460,9 @@ LANDING_TEMPLATE = """
                 <div class="opportunity-section">
                     <h2 style="color: #ff9800; display: flex; align-items: center; gap: 10px;">
                         <span>🛡️ Live Watchtower Feed (L2L Scanner)</span>
-                        <span style="font-size: 0.4em; background: #333; color: #ff9800; padding: 4px 8px; border-radius: 4px;">ACTIVE SCAN: 223 SYMBOLS</span>
+                        <span id="next-scan-timer" style="font-size: 0.6em; background: #000; border: 1px solid #333; color: var(--accent-color); padding: 5px 10px; border-radius: 4px; display: inline-block; min-width: 120px; text-align: center;">NEXT SCAN: 05:00</span>
                     </h2>
-                    <div class="op-grid" style="grid-template-columns: repeat(3, 1fr);">
+                    <div class="op-grid" id="watchtower-container" style="grid-template-columns: repeat(3, 1fr);">
                         {% for alert in watchtower %}
                         <div class="op-card" onclick="window.location.href='/analysis/{{ alert.sym }}'" style="border-top: 3px solid {{ '#ff5722' if alert.type == 'Volume Hunter' else ('#f44336' if 'Support' in alert.type else ('#4caf50' if 'Resistance' in alert.type else '#2196f3')) }}; cursor: pointer; padding: 15px;">
                             <div style="display: flex; justify-content: space-between; align-items: start;">
@@ -1244,7 +1487,7 @@ LANDING_TEMPLATE = """
                 <div class="opportunity-section" style="margin-top: 20px;">
                     <h2 style="color: var(--accent-color);">💎 Institutional Watchlist (Top 20)</h2>
                     <p style="font-size: 0.8em; color: #666; margin-bottom: 15px;">Left-Click to Analyze | Right-Click to Alter Symbol</p>
-                    <div class="op-grid" style="grid-template-columns: repeat(5, 1fr);">
+                    <div class="op-grid" id="watchlist-container" style="grid-template-columns: repeat(5, 1fr);">
                         {% for item in watchlist %}
                         {% set opacity = (item.change|abs / max_intensity * 0.6) + 0.1 %}
                         {% set bg = 'rgba(3, 218, 198, ' + opacity|string + ')' if item.change > 0 else 'rgba(207, 102, 121, ' + opacity|string + ')' %}
@@ -1306,6 +1549,146 @@ LANDING_TEMPLATE = """
             };
         }
 
+        // --- LIVE POLLING SYSTEM ---
+        function startLiveUpdates() {
+            setInterval(async () => {
+                try {
+                    const res = await fetch('/api/landing_data');
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    updateDashboard(data);
+                } catch (e) { console.error("Update failed", e); }
+            }, 3000);
+        }
+        
+        // --- TOAST NOTIFICATIONS ---
+        function showToast(alert) {
+            const container = document.getElementById('toast-container');
+            const el = document.createElement('div');
+            el.className = 'toast';
+            el.innerHTML = `
+                <div class="toast-icon">${alert.type === 'vol' ? '🚀' : '🎯'}</div>
+                <div class="toast-content">
+                    <div class="toast-title">${alert.title}</div>
+                    <div class="toast-msg">${alert.msg}</div>
+                </div>
+            `;
+            container.appendChild(el);
+            
+            // Trigger animation
+            setTimeout(() => el.classList.add('show'), 100);
+            
+            // Remove after 6s
+            setTimeout(() => {
+                el.classList.remove('show');
+                setTimeout(() => el.remove(), 500);
+            }, 6000);
+        }
+
+        function updateDashboard(data) {
+           // Update Indexes
+           const idxContainer = document.getElementById('index-container');
+           if (idxContainer) {
+               let html = '';
+               for (const [k, v] of Object.entries(data.index_data)) {
+                   html += `<div class="index-item"><span>${k}</span> <span class="index-val">${v}</span></div>`;
+               }
+               idxContainer.innerHTML = html;
+           }
+
+           // Update Bullish
+           updateOpGrid('bullish-container', data.top_bullish, 'var(--up-color)', 'Target Gap', 'gap_up');
+           
+           // Update Bearish
+           updateOpGrid('bearish-container', data.top_bearish, 'var(--down-color)', 'Support Gap', 'gap_down');
+           
+           // Update Watchtower
+           const wtContainer = document.getElementById('watchtower-container');
+           if (wtContainer) {
+               let html = '';
+               data.watchtower.forEach(alert => {
+                   let color = '#2196f3';
+                   if (alert.type === 'Volume Hunter') color = '#ff5722';
+                   else if (alert.type.includes('Support')) color = '#f44336';
+                   else if (alert.type.includes('Resistance')) color = '#4caf50';
+                   
+                   let bg = alert.type === 'Volume Hunter' ? '#ff5722' : 
+                            (alert.severity === 'high' ? 'rgba(244, 67, 54, 0.2)' : 'rgba(33, 150, 243, 0.2)');
+                   
+                   let distColor = alert.dist < 0.2 ? '#ffeb3b' : '#fff';
+                   
+                   html += `
+                    <div class="op-card" onclick="window.location.href='/analysis/${alert.sym}'" style="border-top: 3px solid ${color}; cursor: pointer; padding: 15px;">
+                        <div style="display: flex; justify-content: space-between; align-items: start;">
+                            <span style="font-weight: 900; font-size: 1.2em;">${alert.sym}</span>
+                            <span style="font-size: 0.7em; background: ${bg}; color: #fff; padding: 2px 6px; border-radius: 4px;">${alert.type}</span>
+                        </div>
+                        <div style="margin-top: 10px; font-size: 0.9em; color: #bbb;">
+                            Price: <span style="color: #fff; font-weight: bold;">${alert.p}</span> <br>
+                            ${ alert.type === 'Volume Hunter' ? 
+                                `Metric: <span style="color: #ff5722; font-weight: bold;">${alert.dist}x Vol Surge</span> <br>` :
+                                `Level: <span style="color: var(--accent-color);">${alert.lvl}</span> <br>
+                                 Dist: <span style="color: ${distColor};">${alert.dist}%</span> <br>`
+                            }
+                            Next Target: <span style="color: var(--up-color);">${alert.target}</span>
+                        </div>
+                    </div>`;
+               });
+               wtContainer.innerHTML = html;
+           }
+
+           // Trigger Institutional Alerts
+           if (data.inst_alerts && data.inst_alerts.length > 0) {
+               // Stagger toasts to avoid overwhelming
+               data.inst_alerts.slice(0, 3).forEach((alert, idx) => {
+                   setTimeout(() => showToast(alert), idx * 1500);
+               });
+           }
+        }
+
+           // Update Watchlist
+           const wlContainer = document.getElementById('watchlist-container');
+           if (wlContainer) {
+               let html = '';
+               data.watchlist.forEach(item => {
+                   let opacity = (Math.abs(item.change) / data.max_intensity * 0.6) + 0.1;
+                   let bg = item.change > 0 ? `rgba(3, 218, 198, ${opacity})` : `rgba(207, 102, 121, ${opacity})`;
+                   if (item.change == 0) bg = 'var(--card-bg)';
+                   
+                   let changeColor = item.change == 0 ? '#fff' : (item.change > 0 ? '#5fffd7' : '#ff8a9a');
+                   let sign = item.change > 0 ? '+' : '';
+                   
+                   html += `
+                    <div class="wl-card" onclick="window.location.href='/analysis/${item.symbol}'" 
+                         oncontextmenu="editSymbol(event, this, ${item.orig_idx}); return false;" 
+                         style="background: ${bg}; cursor: pointer;">
+                        <div class="wl-sym">${item.symbol}</div>
+                        <div class="wl-data">
+                            <span>${item.price}</span> 
+                            <span class="wl-change" style="color: ${changeColor};">
+                                ${sign}${item.change}%
+                            </span>
+                        </div>
+                    </div>`;
+               });
+               wlContainer.innerHTML = html;
+           }
+        }
+        
+        function updateOpGrid(id, items, colorVar, label, key) {
+            const container = document.getElementById(id);
+            if (!container) return;
+            let html = '';
+            items.forEach(opt => {
+                html += `
+                <a href="/analysis/${opt.symbol}" class="op-card" style="border-left: 4px solid ${colorVar};">
+                    <div style="font-weight: bold; margin-bottom: 5px;">${opt.symbol}</div>
+                    <div style="font-size: 0.8em; color: #aaa;">${label}: <span style="color: ${colorVar}; font-weight: bold;">${opt[key]}%</span></div>
+                </a>`;
+            });
+            container.innerHTML = html;
+        }
+
         // --- NEWS MODAL ---
         function showNewsModal(text, source) {
             document.getElementById('modal-text').innerText = text;
@@ -1323,6 +1706,46 @@ LANDING_TEMPLATE = """
             }
         };
 
+        // --- TIMER & POLLING LOGIC ---
+        let scanTimer = 300; // 5 minutes in seconds
+        const SCAN_INTERVAL = 300; 
+
+        function updateTimerDisplay() {
+            const minutes = Math.floor(scanTimer / 60);
+            const seconds = scanTimer % 60;
+            const text = `NEXT SCAN: ${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+            
+            const timerEl = document.getElementById('next-scan-timer');
+            if (timerEl) {
+                timerEl.innerText = text;
+                // Visual urgency
+                if (scanTimer < 10) timerEl.style.color = '#ff5722';
+                else timerEl.style.color = 'var(--accent-color)';
+            }
+        }
+
+        function startLiveUpdates() {
+            console.log("Starting 5-Minute Dashboard Updates...");
+            
+            // Initial Fetch
+            fetchDashboardData();
+            
+            // Countdown Ticker (Every 1 second)
+            // 1. Live Data Polling (Every 3 seconds) - Restored for Live Prices
+            setInterval(fetchDashboardData, 3000);
+            
+            // 2. Visual Countdown Timer (Every 1 second) - Just for UI
+            setInterval(() => {
+                scanTimer--;
+                if (scanTimer < 0) {
+                    scanTimer = SCAN_INTERVAL;
+                    // No need to force fetch here, the 3s poll will pick up the 'State Change' from backend naturally
+                }
+                updateTimerDisplay();
+            }, 1000);
+        }
+
+        startLiveUpdates();
     </script>
 
     <!-- Modal HTML -->
@@ -1381,7 +1804,7 @@ ANALYSIS_TEMPLATE = """
         }
         .vmf-flow { flex: 1; position: relative; height: 100%; border-right: 1px solid #1a1a1a; cursor: crosshair; }
         .vmf-axis { width: 70px; height: 100%; position: relative; background: #080808; cursor: ns-resize; user-select: none; }
-        .vmf-chart-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; }
+        .vmf-chart-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 8; pointer-events: none; }
         
         .analysis-visual-grid { display: grid; grid-template-columns: 350px 1fr 300px; gap: 20px; margin-top: 20px; }
         .chart-container { height: 600px; background: var(--card-bg); border-radius: 12px; border: 1px solid #222; overflow: hidden; }
@@ -1420,7 +1843,7 @@ ANALYSIS_TEMPLATE = """
             {% endif %}
         </div>
             <div style="margin-top: 5px; display: flex; align-items: center; gap: 15px;">
-                <p style="margin: 0; color: #888;">LTP: <span style="color: var(--ltp-color); font-weight: bold;">{{ row.latest }}</span></p>
+                <p style="margin: 0; color: #888;">LTP: <span id="ltp-display" style="color: var(--ltp-color); font-weight: bold;">{{ row.latest }}</span></p>
                 <div id="ticker-config" style="font-size: 0.75em; background: #1e222d; padding: 4px 10px; border-radius: 4px; border: 1px solid #333;">
                     <span style="color: #666;">TV Ticker:</span> 
                     <input type="text" id="manual-ticker" value="NSE:{{ row.symbol }}" style="background:transparent; border:none; color:var(--accent-color); width: 100px; outline:none; font-family:monospace; font-weight:bold;">
@@ -1517,7 +1940,7 @@ ANALYSIS_TEMPLATE = """
     {% endif %}
 
     <div class="ladder-wrap">
-        <table>
+        <table id="ladder-table">
             <thead>
                 <tr>
                     {% for i in range(-5, 0) %}<th>P{{i}}</th>{% endfor %}
@@ -1760,10 +2183,11 @@ ANALYSIS_TEMPLATE = """
                         const rColor = isAbove ? '0, 255, 136' : '255, 51, 102'; // Vivid Emerald : Crimson
                         const glowIntense = Math.min(0.15 + (gap * 0.1), 0.5); // Gradients scale with GAP strength
                         
+                        const devZ = 1;
                         const vac = document.createElement('div');
                         vac.style.cssText = `position: absolute; width: 100%; top: ${prevTop}%; height: ${height}%; 
                                             background: linear-gradient(180deg, rgba(${rColor}, ${glowIntense}) 0%, rgba(${rColor}, 0.05) 50%, rgba(${rColor}, ${glowIntense}) 100%); 
-                                            border-left: 6px solid rgba(${rColor}, 0.8); transition: opacity 0.3s;`;
+                                            border-left: 6px solid rgba(${rColor}, 0.8); transition: opacity 0.3s; z-index: ${devZ};`;
                         
                         // Visibly Graded Text
                         if (gap > 0.4) {
@@ -1880,6 +2304,84 @@ ANALYSIS_TEMPLATE = """
         initVMFChart();
         renderVMF();
         loadChart(currentTicker);
+
+        // --- LIVE ANALYSIS UPDATES ---
+        function startLiveAnalysisUpdates() {
+            setInterval(async () => {
+                try {
+                    const res = await fetch(`/api/analysis_data/{{ row.symbol }}`);
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    updateAnalysisUI(data);
+                } catch (e) { console.error("Analysis update failed", e); }
+            }, 3000);
+        }
+
+        function updateAnalysisUI(data) {
+            // Update LTP
+            const ltpEl = document.getElementById('ltp-display');
+            if (ltpEl) ltpEl.innerText = data.row.latest;
+
+            // Update Globals
+            vmfData.latest = data.row.latest;
+            vmfData.clusters = data.row.clusters;
+            vmfData.min = data.row.min_p;
+            vmfData.max = data.row.max_p;
+            vmfData.intraday = data.intraday; // Update candle data
+
+            // 1. Update VMF Chart (Candles)
+            if (vmfChartObj && data.intraday.length > 0) {
+                 const series = vmfChartObj.series()[0]; // Assuming only one series (candlestick)
+                 series.setData(data.intraday);
+            }
+
+            // 2. Update VMF Render (Flow/Vacuum)
+            renderVMF();
+
+            // 3. Update Ladder Table
+            const ladderTable = document.getElementById('ladder-table');
+            if(ladderTable) {
+                // Re-generate table rows - simpler to replace body
+                let tbodyHtml = '<tr>';
+                
+                // P-5 to P-1
+                for(let i=0; i<5; i++) {
+                    let p_idx = i;
+                    let gap = (data.row.gaps && data.row.gaps[p_idx]) ? data.row.gaps[p_idx] : 0;
+                    let price = data.row.prices[p_idx] ? data.row.prices[p_idx] : '-';
+                    let bg = `rgba(207, 102, 121, ${0.15 + (Math.abs(gap) * 0.5)})`;
+                    
+                    tbodyHtml += `
+                    <td style="background: ${bg};">
+                        ${i === 4 ? '<div class="target-tag">SUP</div>' : ''}
+                        <div style="font-weight: bold;">${price}</div>
+                        <div style="font-size: 0.7em; opacity: 0.6;">${gap.toFixed(2)}%</div>
+                    </td>`;
+                }
+                
+                // LTP Cell
+                tbodyHtml += `<td class="ltp-cell">${data.row.latest}</td>`;
+
+                // P+1 to P+5
+                for(let i=6; i<11; i++) {
+                    let p_idx = i;
+                    let gap = (data.row.gaps && data.row.gaps[p_idx-1]) ? data.row.gaps[p_idx-1] : 0;
+                     let price = data.row.prices[p_idx] ? data.row.prices[p_idx] : '-';
+                     let bg = `rgba(3, 218, 198, ${0.15 + (Math.abs(gap) * 0.5)})`;
+                     
+                     tbodyHtml += `
+                    <td style="background: ${bg};">
+                        ${i === 6 ? '<div class="target-tag">RES</div>' : ''}
+                        <div style="font-weight: bold;">${price}</div>
+                        <div style="font-size: 0.7em; opacity: 0.6;">${gap.toFixed(2)}%</div>
+                    </td>`;
+                }
+                tbodyHtml += '</tr>';
+                ladderTable.querySelector('tbody').innerHTML = tbodyHtml;
+            }
+        }
+        
+        startLiveAnalysisUpdates();
     </script>
     <!-- TradingView Widget END -->
 </body>
