@@ -1,0 +1,10 @@
+flask
+pandas
+requests
+python-dotenv
+supabase
+kiteconnect
+yfinance
+pytz
+numpy
+gunicorn
