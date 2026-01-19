@@ -4,10 +4,8 @@
     "description": "Python Flask App for Price Ladder",
     "main": "price_ladder_app.py",
     "scripts": {
-        "start": "pip install -r requirements.txt && python price_ladder_app.py"
+        "start": "pip install -r requirements.txt && python price_ladder_app.py",
+        "build": "echo 'No build step required'"
     },
-    "dependencies": {},
-    "engines": {
-        "node": "18.x"
-    }
+    "dependencies": {}
 }
