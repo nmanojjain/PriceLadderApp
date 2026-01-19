@@ -44,14 +44,45 @@ VOL_SAMPLES = {} # Store recent (time, total_volume) snapshots
 NFO_INSTRUMENTS = None # Cache for F&O instruments
 INSTRUMENT_MAP = {} # Cache for symbol -> token mapping
 
-# Global Dashboard Cache
+# Global Dashboard
+NIFTY_50_SYMBOLS = [
+    'ADANIENT', 'ADANIPORTS', 'APOLLOHOSP', 'ASIANPAINT', 'AXISBANK', 'BAJAJ-AUTO', 'BAJFINANCE', 'BAJAJFINSV', 
+    'BEL', 'BPCL', 'BHARTIARTL', 'BRITANNIA', 'CIPLA', 'COALINDIA', 'DIVISLAB', 'DRREDDY', 'EICHERMOT', 
+    'GRASIM', 'HCLTECH', 'HDFCBANK', 'HDFCLIFE', 'HEROMOTOCO', 'HINDALCO', 'HINDUNILVR', 'ICICIBANK', 'ITC', 
+    'INDUSINDBK', 'INFY', 'JSWSTEEL', 'KOTAKBANK', 'LTIM', 'LT', 'M&M', 'MARUTI', 'NESTLEIND', 'NTPC', 
+    'ONGC', 'POWERGRID', 'RELIANCE', 'SBILIFE', 'SHRIRAMFIN', 'SBIN', 'SUNPHARMA', 'TCS', 'TATACONSUM', 
+    'TATAMOTORS', 'TATASTEEL', 'TECHM', 'TITAN', 'TRENT', 'ULTRACEMCO', 'WIPRO', 'ZOMATO'
+]
+
+# Global Cache/State
 GLOBAL_DASHBOARD_CACHE = {
     'last_scan_time': 0,
     'top_bullish': [],
     'top_bearish': [],
-    'watchtower_alerts': [],
-    'watchlist_symbols': [] 
+    'heatmap_data': [],
+    'index_data': {},
+    'all_symbols': [],
+    'curr_adv_map': {},
+    'last_prices': {}
 }
+# Connection State
+KITE_CONNECTED = False
+# Logic State
+EOD_UPDATED_DATE = None 
+
+def is_market_open():
+    """Returns True if current time is Mon-Fri, 09:00 to 15:35 IST"""
+    tz = pytz.timezone('Asia/Kolkata')
+    now = datetime.datetime.now(tz)
+    
+    # Monday=0, Sunday=6
+    if now.weekday() > 4: 
+        return False
+        
+    start_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    end_time = now.replace(hour=15, minute=35, second=0, microsecond=0)
+    
+    return start_time <= now <= end_time
 
 if KITE_API_KEY:
     try:
@@ -661,6 +692,7 @@ def get_stock_data_cloud(symbol, live_price=None):
 
 
 def get_live_prices_batch(symbols):
+    global KITE_CONNECTED
     live_prices = {}
     if not symbols:
         return live_prices
@@ -675,43 +707,51 @@ def get_live_prices_batch(symbols):
             
             try:
                 ltp_data = kite.ltp(final_instruments)
+                # If LTP call succeeds, we are connected
+                KITE_CONNECTED = True
+                
                 for k, v in ltp_data.items():
                     sym = k.replace("NSE:", "").replace("NIFTY 50", "NIFTY").replace("NIFTY BANK", "BANKNIFTY")
                     live_prices[sym] = v['last_price']
-                return live_prices
+                
+                
             except TokenException:
                  print("DEBUG: Zerodha Token Expired during LTP fetch.")
                  kite.access_token = None
+                 KITE_CONNECTED = False
             except Exception as e:
                 print(f"Kite LTP Error: {e}")
+                KITE_CONNECTED = False
 
-        # Prio 2: yfinance (Fallback)
+        # Identify what is missing
+        missing_symbols = [s for s in symbols if s not in live_prices]
+        if not missing_symbols:
+            return live_prices
+
+        # Prio 2: yfinance (Fallback for MISSING only)
         ticker_map = {
             'NIFTY': '^NSEI',
             'BANKNIFTY': '^NSEBANK',
             'SENSEX': '^BSESN',
             'CNXFINANCE': 'NIFTY_FIN_SERVICE.NS'
         }
-        yf_tickers = [ticker_map.get(sym, f"{sym}.NS") for sym in symbols]
+        yf_tickers = [ticker_map.get(sym, f"{sym}.NS") for sym in missing_symbols]
         
-        # Download batch data
+        # Download batch data for missing
         # period="1d" gives today's data. interval="1m" gives minute data.
-        # We just need the latest close.
         data = yf.download(yf_tickers, period="1d", interval="1m", group_by='ticker', threads=True)
         
         if not data.empty:
-            print("DEBUG: Data received from yfinance")
+            print(f"DEBUG: Fetched {len(yf_tickers)} missing symbols from YF")
             # Check if we have multiple tickers or just one
             if len(yf_tickers) > 1:
-                for sym, yf_sym in zip(symbols, yf_tickers):
+                for sym, yf_sym in zip(missing_symbols, yf_tickers):
                     try:
                         # yfinance structure for multiple tickers: data[Ticker]['Close']
-                        # But sometimes if data is missing it might not be there.
                         if yf_sym in data.columns.levels[0]:
                             closes = data[yf_sym]['Close'].dropna()
                             if not closes.empty:
                                 live_prices[sym] = closes.iloc[-1]
-                                print(f"DEBUG: Got price for {sym}: {closes.iloc[-1]}")
                             else:
                                 print(f"DEBUG: No close data for {sym}")
                         else:
@@ -720,11 +760,18 @@ def get_live_prices_batch(symbols):
                         print(f"Error extracting data for {sym}: {e}")
             else:
                 # Single ticker structure: data['Close']
-                sym = symbols[0]
-                closes = data['Close'].dropna()
-                if not closes.empty:
-                    live_prices[sym] = closes.iloc[-1]
-                    print(f"DEBUG: Got price for {sym}: {closes.iloc[-1]}")
+                sym = missing_symbols[0]
+                try:
+                    # If multi-index (Ticker, PriceType)
+                    if isinstance(data.columns, pd.MultiIndex):
+                         closes = data['Close'].dropna()
+                    else:
+                         closes = data['Close'].dropna()
+                         
+                    if not closes.empty:
+                        live_prices[sym] = closes.iloc[-1]
+                except Exception as e:
+                    print(f"single ticker extract error: {e}")
         else:
             print("DEBUG: No data received from yfinance")
                     
@@ -762,9 +809,31 @@ def login():
             kite.set_access_token(access_token)
             # Persist token to .env
             update_env_file("KITE_ACCESS_TOKEN", access_token)
+            global KITE_CONNECTED
+            KITE_CONNECTED = True
             return redirect("/")
         except Exception as e:
             return f"Login failed: {e}", 400
+
+    if not kite:
+        return "Kite Connect not initialized. Check API keys.", 400
+
+    # Redirect to Kite login
+    return redirect(kite.login_url())
+
+@app.route('/logout')
+def logout():
+    global kite, KITE_CONNECTED
+    
+    # 1. Clear Global State
+    if kite: kite.access_token = None
+    KITE_CONNECTED = False
+    
+    # 2. Clear Persistence (.env)
+    update_env_file("KITE_ACCESS_TOKEN", "")
+    
+    print("DEBUG: User manually disconnected from Zerodha.")
+    return redirect("/")
 
 def update_env_file(key, value):
     env_path = ".env"
@@ -787,27 +856,29 @@ def update_env_file(key, value):
         print(f"DEBUG: Saved {key} to .env")
     except Exception as e:
         print(f"Error saving to .env: {e}")
-            
-    if not KITE_API_KEY or not KITE_API_SECRET:
-        return "Please set KITE_API_KEY and KITE_API_SECRET in .env file", 400
-    
-    # Redirect to Kite login
-    return redirect(kite.login_url())
 
 def get_dashboard_data():
-    global GLOBAL_DASHBOARD_CACHE
+    global GLOBAL_DASHBOARD_CACHE, EOD_UPDATED_DATE
     
     # Check if 5 minutes passed since last scan
     current_time = time.time()
     SCAN_INTERVAL = 300 # 5 minutes
     
     # --- PHASE 1: SCANNING (Cached) ---
-    if current_time - GLOBAL_DASHBOARD_CACHE['last_scan_time'] > SCAN_INTERVAL:
+    # Market Hours Logic for Scanner
+    # 1. Market Open OR 2. EOD Sync needed
+    should_scan_market = is_market_open()
+    tz = pytz.timezone('Asia/Kolkata')
+    now = datetime.datetime.now(tz)
+    if now.hour >= 16 and EOD_UPDATED_DATE != now.strftime('%Y-%m-%d'):
+        should_scan_market = True # Force scan for EOD
+
+    if should_scan_market and (current_time - GLOBAL_DASHBOARD_CACHE['last_scan_time'] > SCAN_INTERVAL):
         print("DEBUG: Running 5-Minute Scan Refresh...")
         index_data = {}
         top_bullish = []
         top_bearish = []
-        watchtower_alerts = []
+        heatmap_data = []
         # Fallbacks
         display_symbols = []
         watchlist_symbols = load_watchlist()
@@ -824,7 +895,9 @@ def get_dashboard_data():
                 for idx_sym in index_symbols:
                     if idx_sym in df.columns: index_data[idx_sym] = round(df[idx_sym].dropna().iloc[-1], 2)
                     
+                
                 display_symbols = symbol_columns
+                GLOBAL_DASHBOARD_CACHE['all_symbols'] = display_symbols # Cache for dropdown
                 scan_candidates = [s for s in display_symbols if s not in index_symbols]
                 
                 # Fetch Scan Prices (Batch)
@@ -866,39 +939,46 @@ def get_dashboard_data():
                 top_bullish = sorted([o for o in opportunities if o['bias'] == 'bull'], key=lambda x: x['gap_up'], reverse=True)[:10]
                 top_bearish = sorted([o for o in opportunities if o['bias'] == 'bear'], key=lambda x: x['gap_down'], reverse=True)[:10]
                 
-                # Watchtower Scan Logic (Condensed)
-                # Note: We do a full scan here to populate alerts
-                scan_quotes = {}
+                # NIFTY 50 Heatmap Logic (Cached Calculation)
+                heatmap_list = []
+                
+                # We need live prices/changes for NIFTY 50
+                # We reuse live_price_map if they are in it, else fetch
+                missing_nifty = [s for s in NIFTY_50_SYMBOLS if s not in live_price_map]
+                if missing_nifty:
+                    extra_prices = get_live_prices_batch(missing_nifty)
+                    live_price_map.update(extra_prices)
+                
+                # Fetch Changes via Quote if possible for accuracy, or fallback to CSV Prev Close
+                nifty_quotes = {}
                 if kite and kite.access_token:
                     try:
-                        batch_instruments = [f"NSE:{s}" for s in scan_candidates[:100]] # Limit 100
-                        scan_quotes = kite.quote(batch_instruments)
-                    except TokenException: kite.access_token = None
+                        # Batch fetch quotes for Nifty 50 to get precise 'change' %
+                        nifty_quotes = kite.quote([f"NSE:{s}" for s in NIFTY_50_SYMBOLS])
                     except: pass
                 
-                for sym in scan_candidates:
-                    instr = f"NSE:{sym}"
-                    quote = scan_quotes.get(instr, {})
-                    lp = live_price_map.get(sym) or quote.get('last_price') or (df[sym].dropna().iloc[-1] if not df[sym].dropna().empty else None)
+                for sym in NIFTY_50_SYMBOLS:
+                    lp = live_price_map.get(sym)
                     if not lp: continue
                     
-                    # Volume Spikes
-                    vol_now = quote.get('volume', 0)
-                    spurt_ratio, spurt_msg = detect_intraday_spike(sym, vol_now)
-                    if spurt_ratio > 0 and spurt_msg:
-                        watchtower_alerts.append({'sym': sym, 'p': lp, 'lvl': 'Vol Alert', 'type': 'Volume Hunter', 'target': spurt_msg, 'severity': 'high' if spurt_ratio > 5 else 'med', 'dist': round(spurt_ratio, 1)})
+                    change_pct = 0
+                    prev_close = 0.0
                     
-                    # Level Scans (Simplified reuse of logic)
-                    levels = find_levels(df[sym])
-                    if not levels: continue
-                    r1 = next((l for l in levels if l > lp), None)
-                    s1 = next((l for l in reversed(levels) if l < lp), None)
-                    if r1 and abs((r1-lp)/lp*100) < 0.35:
-                        watchtower_alerts.append({'sym': sym, 'p': lp, 'lvl': r1, 'type': 'Resistance', 'target': 'Breakout', 'severity': 'high', 'dist': round(abs((r1-lp)/lp*100), 2)})
-                    if s1 and abs((lp-s1)/lp*100) < 0.35:
-                        watchtower_alerts.append({'sym': sym, 'p': lp, 'lvl': s1, 'type': 'Support', 'target': 'Breakdown', 'severity': 'high', 'dist': round(abs((lp-s1)/lp*100), 2)})
-
-                watchtower_alerts = sorted(watchtower_alerts, key=lambda x: (x['severity'] == 'high', -x['dist']), reverse=True)[:15]
+                    q = nifty_quotes.get(f"NSE:{sym}")
+                    if q and 'ohlc' in q and q['ohlc']['close'] > 0:
+                         prev_close = float(q['ohlc']['close'])
+                         change_pct = ((lp - prev_close) / prev_close) * 100
+                    else:
+                        # Fallback to CSV prev close
+                        try:
+                            pc = df[sym].dropna().iloc[-1]
+                            prev_close = float(pc)
+                            change_pct = ((lp - prev_close) / prev_close) * 100
+                        except: change_pct = 0
+                    
+                    heatmap_list.append({'symbol': sym, 'price': lp, 'change': round(change_pct, 2), 'prev_close': prev_close})
+                
+                heatmap_data = sorted(heatmap_list, key=lambda x: x['change'], reverse=True)
 
         except Exception as e: print(f"Scan Error: {e}")
         
@@ -906,28 +986,96 @@ def get_dashboard_data():
         GLOBAL_DASHBOARD_CACHE['last_scan_time'] = current_time
         GLOBAL_DASHBOARD_CACHE['top_bullish'] = top_bullish
         GLOBAL_DASHBOARD_CACHE['top_bearish'] = top_bearish
-        GLOBAL_DASHBOARD_CACHE['watchtower_alerts'] = watchtower_alerts
+        GLOBAL_DASHBOARD_CACHE['heatmap_data'] = heatmap_data
+        GLOBAL_DASHBOARD_CACHE['heatmap_data'] = heatmap_data
         GLOBAL_DASHBOARD_CACHE['index_data'] = index_data # Store index baseline
+        
+        # Calculate Watchlist ADV (20-Day Average)
+        try:
+             # Clean symbols for YF
+             ticker_map = {
+                 'NIFTY': '^NSEI',
+                 'BANKNIFTY': '^NSEBANK',
+                 'SENSEX': '^BSESN',
+                 'CNXFINANCE': 'NIFTY_FIN_SERVICE.NS'
+             }
+             yf_tickers = []
+             for s in watchlist_symbols:
+                 clean_s = s.strip()
+                 if clean_s in ticker_map: yf_tickers.append(ticker_map[clean_s])
+                 else: yf_tickers.append(f"{clean_s}.NS")
+             
+             if yf_tickers:
+                 # Fetch 1 month to ensure we get 20 days
+                 adv_data = yf.download(tickers=yf_tickers, period="1mo", progress=False)['Volume']
+                 # Average of last 20 rows
+                 mean_vol = adv_data.tail(20).mean()
+                 # Map back to clean symbol (remove .NS and map index back)
+                 adv_map = {}
+                 rev_map = {v: k for k, v in ticker_map.items()}
+                 
+                 for col in mean_vol.index:
+                     if col in rev_map: clean_sym = rev_map[col]
+                     else: clean_sym = col.replace('.NS', '')
+                     adv_map[clean_sym] = mean_vol[col]
+                 GLOBAL_DASHBOARD_CACHE['curr_adv_map'] = adv_map
+        except Exception as e: 
+             print(f"ADV Fetch Error: {e}")
+             GLOBAL_DASHBOARD_CACHE['curr_adv_map'] = {}
 
     # --- PHASE 2: PRICING UPDATE (Live, Every Call) ---
     # Retrieve Cached Lists
     cached_bullish = GLOBAL_DASHBOARD_CACHE['top_bullish']
     cached_bearish = GLOBAL_DASHBOARD_CACHE['top_bearish']
-    cached_watchtower = GLOBAL_DASHBOARD_CACHE['watchtower_alerts']
+    cached_heatmap = GLOBAL_DASHBOARD_CACHE['heatmap_data']
     base_watchlist = load_watchlist()
     
     # Collect ALL symbols needed for display
     all_needed_syms = set()
     for o in cached_bullish: all_needed_syms.add(o['symbol'])
     for o in cached_bearish: all_needed_syms.add(o['symbol'])
-    for w in cached_watchtower: all_needed_syms.add(w['sym'])
+    for h in cached_heatmap: all_needed_syms.add(h['symbol'])
     for s in base_watchlist: all_needed_syms.add(s)
     index_symbols = ['NIFTY', 'BANKNIFTY', 'SENSEX', 'CNXFINANCE']
     for i in index_symbols: all_needed_syms.add(i)
     
-    # Batch Fetch LIVE NOW
-    live_prices_now = get_live_prices_batch(list(all_needed_syms))
+    # Batch Fetch LIVE NOW (With Market Hours Logic)
+    # global EOD_UPDATED_DATE (Moved to top)
+    should_fetch = False
     
+    tz = pytz.timezone('Asia/Kolkata')
+    now = datetime.datetime.now(tz)
+    
+    # 1. Market Open?
+    if is_market_open():
+        should_fetch = True
+        
+    # 2. EOD Check (After 16:00, Once per day)
+    elif now.hour >= 16:
+        today_str = now.strftime('%Y-%m-%d')
+        if EOD_UPDATED_DATE != today_str:
+            print(f"DEBUG: Triggering EOD Sync for {today_str}")
+            should_fetch = True
+            EOD_UPDATED_DATE = today_str # Mark done
+            
+    live_prices_now = {}
+    
+    # DEBUG AUTH STATUS
+    # print(f"DEBUG: Kite Object: {kite is not None}, Token: {kite.access_token if kite else 'None'}")
+    
+    if should_fetch:
+        live_prices_now = get_live_prices_batch(list(all_needed_syms))
+        GLOBAL_DASHBOARD_CACHE['last_prices'] = live_prices_now # Update Cache
+    else:
+        # Sleep Mode - Use Cache
+        live_prices_now = GLOBAL_DASHBOARD_CACHE.get('last_prices', {})
+        if not live_prices_now:
+             # Try one fetch if cache empty even if closed? Or just empty.
+             # Better to try once if empty so UI isn't blank on restart
+             print("DEBUG: Cache empty in sleep mode, fetching once.")
+             live_prices_now = get_live_prices_batch(list(all_needed_syms))
+             GLOBAL_DASHBOARD_CACHE['last_prices'] = live_prices_now
+
     # Rebuild Return Objects with FRESH prices
     final_bullish = []
     for item in cached_bullish:
@@ -940,12 +1088,18 @@ def get_dashboard_data():
         
     final_bearish = [x for x in cached_bearish]
     
-    # Watchtower Fresh Prices
-    final_watchtower = []
-    for alert in cached_watchtower:
-        new_alert = alert.copy()
-        if alert['sym'] in live_prices_now: new_alert['p'] = live_prices_now[alert['sym']]
-        final_watchtower.append(new_alert)
+    # Heatmap Fresh Prices
+    final_heatmap = []
+    for item in cached_heatmap:
+        new_item = item.copy()
+        if item['symbol'] in live_prices_now: 
+            new_lp = live_prices_now[item['symbol']]
+            new_item['price'] = new_lp
+            # Dynamic Recalc of % Change
+            if 'prev_close' in item and item['prev_close'] > 0:
+                new_item['change'] = round(((new_lp - item['prev_close']) / item['prev_close']) * 100, 2)
+            
+        final_heatmap.append(new_item)
 
     # Watchlist Fresh (Always Dynamic)
     watchlist_details = []
@@ -974,25 +1128,48 @@ def get_dashboard_data():
 
     for i, sym in enumerate(base_watchlist):
         lp = live_prices_now.get(sym, 0)
-        chg = 0
+        change_pct = 0
         
         # Try get change from Zerodha
         q = scan_quotes.get(f"NSE:{sym}")
-        if q: chg = q.get('change', 0)
+        prev_close = 0.0
+        
+        if q and 'ohlc' in q and q['ohlc']['close'] > 0:
+            prev_close = float(q['ohlc']['close'])
+            change_pct = ((lp - prev_close) / prev_close) * 100
         elif lp > 0:
-             # Fallback: We don't have prev close easily without CSV.
-             # User accepts 0 change if no feed? Or use cache?
-             # Let's use cache if available, else 0.
-             pass 
+             # Fallback from CSV
+             try:
+                 if sym in df.columns:
+                     pc = df[sym].dropna().iloc[-1]
+                     prev_close = float(pc)
+                     change_pct = ((lp - float(pc))/float(pc)) * 100
+             except: pass
              
         # Alerts
         # Recalculate Volume alert? Maybe keep alerts cached too?
         # User wants "Instance" alerts. Let's run Vol check live as it is fast.
         vol = q.get('volume', 0) if q else 0
         ratio, msg = detect_intraday_spike(sym, vol)
-        if ratio > 3: inst_alerts.append({'title':f"★ {sym} VOL", 'msg':f"{msg} {ratio}x", 'type':'vol'})
         
-        watchlist_details.append({'symbol': sym, 'price': lp, 'change': chg, 'orig_idx': i})
+        if ratio > 3: 
+            # Get ADV from cache
+            adv_map = GLOBAL_DASHBOARD_CACHE.get('curr_adv_map', {})
+            adv = adv_map.get(sym, 0)
+            
+            # Format ADV
+            adv_str = "N/A"
+            if adv > 10000000: adv_str = f"{round(adv/10000000, 2)}Cr"
+            elif adv > 100000: adv_str = f"{round(adv/100000, 2)}L"
+            elif adv > 0: adv_str = f"{int(adv)}"
+            
+            inst_alerts.append({
+                'title': f"★ {sym} VOL", 
+                'msg': f"{msg} {ratio}x<br><span style='font-size:0.8em; color:#aaa;'>Avg Vol: {adv_str}</span>", 
+                'type': 'vol'
+            })
+        
+        watchlist_details.append({'symbol': sym, 'price': lp, 'change': round(change_pct, 2), 'orig_idx': i, 'prev_close': prev_close})
     
     watchlist_details = sorted(watchlist_details, key=lambda x: x['change'], reverse=True)
     all_changes = [abs(x['change']) for x in watchlist_details]
@@ -1007,12 +1184,13 @@ def get_dashboard_data():
         'index_data': final_index,
         'top_bullish': final_bullish,
         'top_bearish': final_bearish,
-        'watchtower': final_watchtower,
+        'heatmap': final_heatmap,
         'watchlist': watchlist_details,
         'inst_alerts': inst_alerts,
         'max_intensity': max_intensity,
-        'kite_authenticated': True if (kite and kite.access_token) else False,
-        'news_list': get_live_news()
+        'kite_authenticated': True if (kite and kite.access_token) else False, # Check actual token validity
+        'news_list': get_live_news(),
+        'symbols': GLOBAL_DASHBOARD_CACHE.get('all_symbols', [])
     }
 
 @app.route('/api/landing_data')
@@ -1374,8 +1552,22 @@ LANDING_TEMPLATE = """
         .toast-content { flex: 1; }
         .toast-title { font-weight: 900; font-size: 0.9em; margin-bottom: 5px; color: #ffd700; text-transform: uppercase; letter-spacing: 1px; }
         .toast-msg { font-size: 0.8em; color: #ccc; line-height: 1.4; }
+
+        .refresh-btn {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid #444;
+            color: #aaa;
+            font-size: 0.7em;
+            padding: 2px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-left: 10px;
+            text-transform: uppercase;
+            transition: all 0.2s;
+        }
+        .refresh-btn:hover { background: rgba(255, 255, 255, 0.2); color: #fff; border-color: #666; }
+        .refresh-btn:active { transform: scale(0.95); }
     </style>
-</head>
 </head>
 <body>
     <div id="toast-container"></div>
@@ -1399,14 +1591,18 @@ LANDING_TEMPLATE = """
                 <script>setInterval(() => document.getElementById('clock').innerText = new Date().toLocaleTimeString(), 1000);</script>
                 
                 {% if kite_authenticated %}
-                <div style="background: rgba(3, 218, 198, 0.1); border: 1px solid var(--up-color); color: var(--up-color); padding: 5px 12px; border-radius: 20px; font-size: 0.7em; font-weight: bold; display: inline-flex; align-items: center; gap: 5px;">
-                    <span style="height: 8px; width: 8px; background: var(--up-color); border-radius: 50%;"></span>
-                    ZERODHA KITE CONNECTED
-                </div>
-                {% else %}
-                <a href="/login" style="background: var(--accent-color); color: #000; padding: 8px 15px; border-radius: 5px; text-decoration: none; font-weight: bold; font-size: 0.8em; display: inline-block;">
-                    ⚡ LOGIN TO ZERODHA
+                <a href="/logout" onclick="return confirm('Disconnect from Zerodha API? This will stop live updates.');" style="text-decoration: none;">
+                    <div id="connection-status-wrapper" style="background: rgba(3, 218, 198, 0.1); border: 1px solid var(--up-color); color: var(--up-color); padding: 5px 12px; border-radius: 20px; font-size: 0.7em; font-weight: bold; display: inline-flex; align-items: center; gap: 5px; cursor: pointer;">
+                        <span style="height: 8px; width: 8px; background: var(--up-color); border-radius: 50%;"></span>
+                        ZERODHA KITE CONNECTED (DISCONNECT)
+                    </div>
                 </a>
+                {% else %}
+                <div id="connection-status-wrapper">
+                    <a href="/login" style="background: var(--accent-color); color: #000; padding: 8px 15px; border-radius: 5px; text-decoration: none; font-weight: bold; font-size: 0.8em; display: inline-block;">
+                        ⚡ LOGIN TO ZERODHA
+                    </a>
+                </div>
                 {% endif %}
             </div>
         </div>
@@ -1428,12 +1624,39 @@ LANDING_TEMPLATE = """
                     </datalist>
                     <button type="submit" style="width: 100%; margin-top: 10px;">Deep Dive Analyze</button>
                 </form>
+                </form>
+
+                <div class="opportunity-section" style="margin-top: 20px;">
+                    <h2 style="color: var(--accent-color); font-size: 1.2em;">
+                        💎 Watchlist
+                        <button class="refresh-btn" onclick="manualRefresh(this)">Refresh</button>
+                    </h2>
+                    <p style="font-size: 0.7em; color: #666; margin-bottom: 10px;">L: Analyze | R: Edit</p>
+                    <div class="op-grid" id="watchlist-container" style="grid-template-columns: repeat(2, 1fr); gap: 5px;">
+                        {% for item in watchlist %}
+                        {% set is_up = item.change >= 0 %}
+                        {% set base_op = (item.change|abs / 3.0) %}
+                        {% if base_op > 0.8 %}{% set base_op = 0.8 %}{% endif %}
+                        {% if base_op < 0.2 %}{% set base_op = 0.2 %}{% endif %}
+                        {% set bg = 'rgba(0, 200, 83, ' + base_op|string + ')' if is_up else 'rgba(213, 0, 0, ' + base_op|string + ')' %}
+                        
+                        <div class="op-card" data-index="{{ item.orig_idx }}" onclick="handleWatchlistClick(event, '{{ item.symbol }}')"
+                             style="background: {{ bg }}; cursor: pointer; padding: 5px; border: 1px solid #222; min-height: 40px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;">
+                            <div class="wl-sym" style="font-weight: 900; font-size: 0.75em; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.8);">{{ item.symbol }}</div>
+                            <div style="font-size: 0.65em; color: #fff; font-weight: bold; margin-top: 1px;">{{ item.change }}%</div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
             </div>
 
             <div class="main">
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px;">
                     <div class="opportunity-section">
-                        <h2 style="color: var(--up-color);">🚀 Top Bullish Breakouts</h2>
+                        <h2 style="color: var(--up-color);">
+                            🚀 Top Bullish Breakouts
+                            <button class="refresh-btn" onclick="manualRefresh(this)">Refresh</button>
+                        </h2>
                         <div class="op-grid" id="bullish-container">
                             {% for opt in top_bullish %}
                             <a href="/analysis/{{ opt.symbol }}" class="op-card" style="border-left: 4px solid var(--up-color);">
@@ -1445,7 +1668,10 @@ LANDING_TEMPLATE = """
                     </div>
 
                     <div class="opportunity-section">
-                        <h2 style="color: var(--down-color);">📉 Top Bearish Vacuums</h2>
+                        <h2 style="color: var(--down-color);">
+                            📉 Top Bearish Vacuums
+                            <button class="refresh-btn" onclick="manualRefresh(this)">Refresh</button>
+                        </h2>
                         <div class="op-grid" id="bearish-container">
                             {% for opt in top_bearish %}
                              <a href="/analysis/{{ opt.symbol }}" class="op-card" style="border-left: 4px solid var(--down-color);">
@@ -1459,106 +1685,147 @@ LANDING_TEMPLATE = """
 
                 <div class="opportunity-section">
                     <h2 style="color: #ff9800; display: flex; align-items: center; gap: 10px;">
-                        <span>🛡️ Live Watchtower Feed (L2L Scanner)</span>
+                        <span>📊 NIFTY 50 Heatmap</span>
                         <span id="next-scan-timer" style="font-size: 0.6em; background: #000; border: 1px solid #333; color: var(--accent-color); padding: 5px 10px; border-radius: 4px; display: inline-block; min-width: 120px; text-align: center;">NEXT SCAN: 05:00</span>
+                        <button class="refresh-btn" onclick="manualRefresh(this)">Refresh</button>
                     </h2>
-                    <div class="op-grid" id="watchtower-container" style="grid-template-columns: repeat(3, 1fr);">
-                        {% for alert in watchtower %}
-                        <div class="op-card" onclick="window.location.href='/analysis/{{ alert.sym }}'" style="border-top: 3px solid {{ '#ff5722' if alert.type == 'Volume Hunter' else ('#f44336' if 'Support' in alert.type else ('#4caf50' if 'Resistance' in alert.type else '#2196f3')) }}; cursor: pointer; padding: 15px;">
-                            <div style="display: flex; justify-content: space-between; align-items: start;">
-                                <span style="font-weight: 900; font-size: 1.2em;">{{ alert.sym }}</span>
-                                <span style="font-size: 0.7em; background: {{ '#ff5722' if alert.type == 'Volume Hunter' else ('rgba(244, 67, 54, 0.2)' if alert.severity == 'high' else 'rgba(33, 150, 243, 0.2)') }}; color: #fff; padding: 2px 6px; border-radius: 4px;">{{ alert.type }}</span>
-                            </div>
-                            <div style="margin-top: 10px; font-size: 0.9em; color: #bbb;">
-                                Price: <span style="color: #fff; font-weight: bold;">{{ alert.p }}</span> <br>
-                                {% if alert.type == 'Volume Hunter' %}
-                                    Metric: <span style="color: #ff5722; font-weight: bold;">{{ alert.dist }}x Vol Surge</span> <br>
-                                {% else %}
-                                    Level: <span style="color: var(--accent-color);">{{ alert.lvl }}</span> <br>
-                                    Dist: <span style="color: {{ '#ffeb3b' if alert.dist < 0.2 else '#fff' }};">{{ alert.dist }}%</span> <br>
-                                {% endif %}
-                                Next Target: <span style="color: var(--up-color);">{{ alert.target }}</span>
-                            </div>
+                    <div class="op-grid" id="heatmap-container" style="grid-template-columns: repeat(10, 1fr); gap: 5px;">
+                        {% for item in heatmap %}
+                        {% set is_up = item.change >= 0 %}
+                        {% set base_op = (item.change|abs / 3.0) %}
+                        {% if base_op > 0.8 %}{% set base_op = 0.8 %}{% endif %}
+                        {% if base_op < 0.2 %}{% set base_op = 0.2 %}{% endif %}
+                        {% set bg_col = 'rgba(0, 200, 83, ' + base_op|string + ')' if is_up else 'rgba(213, 0, 0, ' + base_op|string + ')' %}
+                        
+                        <div class="op-card" onclick="window.location.href='/analysis/{{ item.symbol }}'" 
+                             style="background: {{ bg_col }}; cursor: pointer; padding: 10px; border: 1px solid #222; min-height: 50px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;">
+                            <div style="font-weight: 900; font-size: 0.8em; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.8);">{{ item.symbol }}</div>
+                            <div style="font-size: 0.7em; color: #fff; font-weight: bold; margin-top: 2px;">{{ item.change }}%</div>
+                            <div style="font-size: 0.6em; color: rgba(255,255,255,0.7);">{{ item.price }}</div>
                         </div>
                         {% endfor %}
                     </div>
                 </div>
 
-                <div class="opportunity-section" style="margin-top: 20px;">
-                    <h2 style="color: var(--accent-color);">💎 Institutional Watchlist (Top 20)</h2>
-                    <p style="font-size: 0.8em; color: #666; margin-bottom: 15px;">Left-Click to Analyze | Right-Click to Alter Symbol</p>
-                    <div class="op-grid" id="watchlist-container" style="grid-template-columns: repeat(5, 1fr);">
-                        {% for item in watchlist %}
-                        {% set opacity = (item.change|abs / max_intensity * 0.6) + 0.1 %}
-                        {% set bg = 'rgba(3, 218, 198, ' + opacity|string + ')' if item.change > 0 else 'rgba(207, 102, 121, ' + opacity|string + ')' %}
-                        {% if item.change == 0 %}{% set bg = 'var(--card-bg)' %}{% endif %}
-                        
-                        <div class="wl-card" onclick="window.location.href='/analysis/{{ item.symbol }}'" oncontextmenu="editSymbol(event, this, {{ item.orig_idx }}); return false;" style="background: {{ bg }}; cursor: pointer;">
-                            <div class="wl-sym">{{ item.symbol }}</div>
-                            <div class="wl-data">
-                                <span>{{ item.price }}</span> 
-                                <span class="wl-change" style="color: {{ '#fff' if item.change == 0 else ('#5fffd7' if item.change > 0 else '#ff8a9a') }};">
-                                    {{ '+' if item.change > 0 }}{{ item.change }}%
-                                </span>
-                            </div>
-                        </div>
-                        {% endfor %}
-                    </div>
-                </div>
+
             </div>
         </div>
     </div>
 
     <script>
-        function editSymbol(e, el, index) {
-            if (e) {
-                e.preventDefault();
-                e.stopPropagation();
+        window.isEditing = false;
+
+        // --- NEW: EVENT DELEGATION FOR WATCHLIST ---
+        document.addEventListener('DOMContentLoaded', () => {
+            const wlContainer = document.getElementById('watchlist-container');
+            if (wlContainer) {
+                wlContainer.addEventListener('contextmenu', function(e) {
+                    const card = e.target.closest('.op-card');
+                    if (card) {
+                        e.preventDefault(); // Stop context menu
+                        e.stopPropagation();
+                        
+                        console.log("Right-Click Detected on card:", card);
+                        const index = card.getAttribute('data-index');
+                        startEditing(card, index);
+                    }
+                });
             }
-            const currentSym = el.querySelector('.wl-sym').innerText.trim();
+        });
+
+        function handleWatchlistClick(e, symbol) {
+            if (window.isEditing) {
+                e.preventDefault();
+                return;
+            }
+            window.location.href = '/analysis/' + symbol;
+        }
+
+        function startEditing(el, index) {
+            console.log("Starting Edit Mode for Index:", index);
+            
+            // Visual feedback
+            el.style.backgroundColor = '#222';
+            el.style.border = '1px solid var(--accent-color)';
+            
+            const currentSymEl = el.querySelector('.wl-sym');
+            if(!currentSymEl) return; // Already editing?
+            
+            const currentSym = currentSymEl.innerText.trim();
+            window.isEditing = true; // Block live updates
+            
+            // Create Input
             const input = document.createElement('input');
             input.value = currentSym;
             input.style.width = '100%';
             input.style.textAlign = 'center';
             input.style.background = '#000';
             input.style.color = '#fff';
-            input.style.border = '1px solid var(--accent-color)';
+            input.style.border = 'none';
+            input.style.fontSize = '1em';
+            input.style.fontWeight = 'bold';
             
-            el.innerHTML = '';
+            el.innerHTML = ''; // Clear card content
             el.appendChild(input);
             input.focus();
-
-            input.onblur = () => window.location.reload(); // Simplest to reload to reset state
-            input.onkeydown = async (e) => { 
-                if(e.key === 'Enter') {
+            
+            // Cleanup on blur or enter
+            const finish = async (save) => {
+                if (save) {
                     const newSym = input.value.toUpperCase().trim();
                     if (newSym && newSym !== currentSym) {
-                        const response = await fetch('/update_watchlist', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({index: index, symbol: newSym})
-                        });
-                        if (response.ok) {
-                            window.location.reload();
-                            return;
-                        }
+                        try {
+                            const response = await fetch('/update_watchlist', {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({index: parseInt(index), symbol: newSym})
+                            });
+                        } catch(e) { console.error(e); }
                     }
-                    window.location.reload();
                 }
-                if(e.key === 'Escape') window.location.reload();
+                window.location.reload(); // Always reload to reset state
+            };
+
+            // Delay onblur binding slightly to avoid immediate trigger
+            setTimeout(() => {
+                input.onblur = () => finish(false);
+            }, 500);
+
+            input.onkeydown = (e) => {
+                if(e.key === 'Enter') finish(true);
+                if(e.key === 'Escape') finish(false);
             };
         }
 
         // --- LIVE POLLING SYSTEM ---
-        function startLiveUpdates() {
-            setInterval(async () => {
-                try {
-                    const res = await fetch('/api/landing_data');
-                    if (!res.ok) return;
-                    const data = await res.json();
-                    updateDashboard(data);
-                } catch (e) { console.error("Update failed", e); }
-            }, 3000);
+        // --- LIVE POLLING SYSTEM ---
+        // --- LIVE POLLING SYSTEM ---
+        // --- LIVE POLLING SYSTEM ---
+        async function fetchDashboardData() {
+            if (window.isEditing) return; // Skip update if user is editing
+            try {
+                const res = await fetch('/api/landing_data');
+                if (!res.ok) return;
+                const data = await res.json();
+                if (window.isEditing) return; // Race condition fix: check again before updating DOM
+                updateDashboard(data);
+            } catch (e) { console.error("Update failed", e); }
+        }
+
+        async function manualRefresh(btn) {
+            if (!btn) return;
+            const originalText = btn.innerText;
+            btn.innerText = "Refreshing...";
+            btn.style.opacity = "0.7";
+            btn.disabled = true;
+            
+            await fetchDashboardData();
+            
+            setTimeout(() => {
+                btn.innerText = originalText;
+                btn.style.opacity = "1";
+                btn.disabled = false;
+            }, 500);
         }
         
         // --- TOAST NOTIFICATIONS ---
@@ -1602,39 +1869,26 @@ LANDING_TEMPLATE = """
            // Update Bearish
            updateOpGrid('bearish-container', data.top_bearish, 'var(--down-color)', 'Support Gap', 'gap_down');
            
-           // Update Watchtower
-           const wtContainer = document.getElementById('watchtower-container');
-           if (wtContainer) {
+           // Update Heatmap
+           const hmContainer = document.getElementById('heatmap-container');
+           if (hmContainer && data.heatmap) {
                let html = '';
-               data.watchtower.forEach(alert => {
-                   let color = '#2196f3';
-                   if (alert.type === 'Volume Hunter') color = '#ff5722';
-                   else if (alert.type.includes('Support')) color = '#f44336';
-                   else if (alert.type.includes('Resistance')) color = '#4caf50';
-                   
-                   let bg = alert.type === 'Volume Hunter' ? '#ff5722' : 
-                            (alert.severity === 'high' ? 'rgba(244, 67, 54, 0.2)' : 'rgba(33, 150, 243, 0.2)');
-                   
-                   let distColor = alert.dist < 0.2 ? '#ffeb3b' : '#fff';
-                   
+               data.heatmap.forEach(item => {
+                   let is_up = item.change >= 0;
+                   let base_op = (Math.abs(item.change) / 3.0);
+                   if (base_op > 0.8) base_op = 0.8;
+                   if (base_op < 0.2) base_op = 0.2;
+                   let bg_col = is_up ? `rgba(0, 200, 83, ${base_op})` : `rgba(213, 0, 0, ${base_op})`;
+
                    html += `
-                    <div class="op-card" onclick="window.location.href='/analysis/${alert.sym}'" style="border-top: 3px solid ${color}; cursor: pointer; padding: 15px;">
-                        <div style="display: flex; justify-content: space-between; align-items: start;">
-                            <span style="font-weight: 900; font-size: 1.2em;">${alert.sym}</span>
-                            <span style="font-size: 0.7em; background: ${bg}; color: #fff; padding: 2px 6px; border-radius: 4px;">${alert.type}</span>
-                        </div>
-                        <div style="margin-top: 10px; font-size: 0.9em; color: #bbb;">
-                            Price: <span style="color: #fff; font-weight: bold;">${alert.p}</span> <br>
-                            ${ alert.type === 'Volume Hunter' ? 
-                                `Metric: <span style="color: #ff5722; font-weight: bold;">${alert.dist}x Vol Surge</span> <br>` :
-                                `Level: <span style="color: var(--accent-color);">${alert.lvl}</span> <br>
-                                 Dist: <span style="color: ${distColor};">${alert.dist}%</span> <br>`
-                            }
-                            Next Target: <span style="color: var(--up-color);">${alert.target}</span>
-                        </div>
+                    <div class="op-card" onclick="window.location.href='/analysis/${item.symbol}'" 
+                         style="background: ${bg_col}; cursor: pointer; padding: 10px; border: 1px solid #222; min-height: 50px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;">
+                        <div style="font-weight: 900; font-size: 0.8em; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.8);">${item.symbol}</div>
+                        <div style="font-size: 0.7em; color: #fff; font-weight: bold; margin-top: 2px;">${item.change}%</div>
+                        <div style="font-size: 0.6em; color: rgba(255,255,255,0.7);">${item.price}</div>
                     </div>`;
                });
-               wtContainer.innerHTML = html;
+               hmContainer.innerHTML = html;
            }
 
            // Trigger Institutional Alerts
@@ -1644,35 +1898,85 @@ LANDING_TEMPLATE = """
                    setTimeout(() => showToast(alert), idx * 1500);
                });
            }
-        }
-
+           
            // Update Watchlist
            const wlContainer = document.getElementById('watchlist-container');
-           if (wlContainer) {
+           if (wlContainer && data.watchlist) {
                let html = '';
                data.watchlist.forEach(item => {
-                   let opacity = (Math.abs(item.change) / data.max_intensity * 0.6) + 0.1;
-                   let bg = item.change > 0 ? `rgba(3, 218, 198, ${opacity})` : `rgba(207, 102, 121, ${opacity})`;
-                   if (item.change == 0) bg = 'var(--card-bg)';
-                   
-                   let changeColor = item.change == 0 ? '#fff' : (item.change > 0 ? '#5fffd7' : '#ff8a9a');
-                   let sign = item.change > 0 ? '+' : '';
+                   let is_up = item.change >= 0;
+                   let base_op = (Math.abs(item.change) / 3.0);
+                   if (base_op > 0.8) base_op = 0.8;
+                   if (base_op < 0.2) base_op = 0.2;
+                   let bg = is_up ? `rgba(0, 200, 83, ${base_op})` : `rgba(213, 0, 0, ${base_op})`;
                    
                    html += `
-                    <div class="wl-card" onclick="window.location.href='/analysis/${item.symbol}'" 
-                         oncontextmenu="editSymbol(event, this, ${item.orig_idx}); return false;" 
-                         style="background: ${bg}; cursor: pointer;">
-                        <div class="wl-sym">${item.symbol}</div>
-                        <div class="wl-data">
-                            <span>${item.price}</span> 
-                            <span class="wl-change" style="color: ${changeColor};">
-                                ${sign}${item.change}%
-                            </span>
-                        </div>
+                    <div class="op-card" data-index="${item.orig_idx}" onclick="handleWatchlistClick(event, '${item.symbol}')"
+                         style="background: ${bg}; cursor: pointer; padding: 5px; border: 1px solid #222; min-height: 40px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;">
+                        <div class="wl-sym" style="font-weight: 900; font-size: 0.75em; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.8);">${item.symbol}</div>
+                        <div style="font-size: 0.65em; color: #fff; font-weight: bold; margin-top: 1px;">${item.change}%</div>
                     </div>`;
                });
                wlContainer.innerHTML = html;
            }
+
+            // Update Connection Status Indicator
+            const connWrapper = document.getElementById('connection-status-wrapper');
+            if (connWrapper) {
+                 // console.log("DEBUG: Auth State:", data.kite_authenticated); // Debug
+                 if (data.kite_authenticated) {
+                     // State: CONNECTED
+                     // Ensure we have the wrapper structure for connected state (inside <a>)
+                     // Safest way: Replace the PARENT if it's the anchor, or the div itself?
+                     // Let's replace the element entirely to match the template structure.
+                     
+                     // We need to match the template's structure to avoid drift.
+                     // Template: 
+                     // Connected: <a href="/logout"><div id="wrapper">...</div></a>
+                     // Disconnected: <div id="wrapper"><a href="/login">...</a></div>
+                     
+                     // If we are currently disconnected (Div wrapper), we need to wrap it in an anchor?
+                     // Or easier: Just put the Anchor INSIDE the wrapper for both, but styled differently?
+                     // Current Template structure is asymmetric. JS needs to handle swap.
+                     
+                     // Strategy: Always render the "Connected" badge as an A tag, and "Disconnected" as a Div with A tag.
+                     // We find the 'container'. The container is the parent of connWrapper.
+                     let parent = connWrapper.parentElement;
+                     let isParentAnchor = parent.tagName === 'A';
+                     
+                     if (isParentAnchor) {
+                         // Already an anchor (Connected State), just update content text
+                         connWrapper.innerHTML = '<span class="status-badge" style="background-color: #00c853; color: black; box-shadow: 0 0 10px #00c853;">ZERODHA CONNECTED (CLICK TO DISCONNECT)</span>';
+                     } else {
+                         // Currently Disconnected (Div is child of container), switch to Connected
+                         // We need to replace the DIV with the ANCHOR-wrapped DIV.
+                         connWrapper.outerHTML = `
+                         <a href="/logout" onclick="return confirm('Disconnect from Zerodha API?');" style="text-decoration: none;">
+                            <div id="connection-status-wrapper" style="background: rgba(3, 218, 198, 0.1); border: 1px solid var(--up-color); color: var(--up-color); padding: 5px 12px; border-radius: 20px; font-size: 0.7em; font-weight: bold; display: inline-flex; align-items: center; gap: 5px; cursor: pointer;">
+                                <span style="height: 8px; width: 8px; background: var(--up-color); border-radius: 50%;"></span>
+                                ZERODHA CONNECTED (CLICK TO DISCONNECT)
+                            </div>
+                         </a>`;
+                     }
+
+                 } else {
+                     // State: DISCONNECTED
+                     let parent = connWrapper.parentElement;
+                     let isParentAnchor = parent.tagName === 'A';
+                     
+                     if (isParentAnchor) {
+                         // Currently Connected (Anchor wrapper), switch to Disconnected (Div wrapper)
+                         // Replace the PARENT (Anchor) with the DIV
+                         parent.outerHTML = `
+                         <div id="connection-status-wrapper">
+                            <a href="/login" class="zerodha-btn blink-red" style="text-decoration:none; color:white;">LOGIN TO ZERODHA</a>
+                         </div>`;
+                     } else {
+                         // Already Disconnected, just ensure content
+                         connWrapper.innerHTML = '<a href="/login" class="zerodha-btn blink-red" style="text-decoration:none; color:white;">LOGIN TO ZERODHA</a>';
+                     }
+                 }
+            }
         }
         
         function updateOpGrid(id, items, colorVar, label, key) {
@@ -1829,6 +2133,10 @@ ANALYSIS_TEMPLATE = """
         .modal-content { background: #1e222d; padding: 25px; border-radius: 12px; border: 1px solid var(--accent-color); max-width: 500px; width: 90%; color: #fff; box-shadow: 0 0 20px rgba(187, 134, 252, 0.2); }
         .modal-close { float: right; cursor: pointer; color: #888; font-size: 1.2em; }
         .modal-close:hover { color: #fff; }
+
+        /* Connection Blink */
+        @keyframes blinker { 50% { opacity: 0; } }
+        .blink-red { animation: blinker 1s linear infinite; background-color: #d50000 !important; color: white !important; border: 1px solid #ff1744 !important; }
     </style>
 </head>
 <body>
@@ -2390,4 +2698,4 @@ ANALYSIS_TEMPLATE = """
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, use_reloader=False)
